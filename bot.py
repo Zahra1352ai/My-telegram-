@@ -440,15 +440,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     u_rec = get_user_record(user_id)
 
-    if user_id != ADMIN_ID:
+    state = admin_states.get(user_id)
+
+    # ==========================================
+    # 🔥 اصلاح: استثنا کردن مراحل واریز از بررسی Maintenance و Ban
+    # ==========================================
+    is_deposit_step = state in ["WAITING_DEPOSIT_AMOUNT", "WAITING_DEPOSIT_HASH"]
+
+    if user_id != ADMIN_ID and not is_deposit_step:
         if not config_db.get("active", True):
             await update.message.reply_text("🔴 The bot is currently under maintenance.")
             return
         if u_rec.get("banned", False):
             await update.message.reply_text("⛔ You are banned from using this bot.")
             return
-
-    state = admin_states.get(user_id)
 
     if text == "❌ Cancel":
         admin_states.pop(user_id, None)
@@ -502,14 +507,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = user_deposit_amounts.pop(user_id, 0.0)
         admin_states.pop(user_id, None)
         
-        await update.message.reply_text(
-            "⏳ **Transaction Submitted!**\n\n"
-            "Your payment invoice and transaction hash have been sent to the admin for verification. "
-            "You will be notified as soon as it is approved.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard(user_id)
-        )
-        
+        # 🔥 اصلاح: پیام موفقیت را بعد از ارسال فاکتور بفرست
         user_obj = update.message.from_user
         username_str = f"@{user_obj.username}" if user_obj.username else "No Username"
         
@@ -530,6 +528,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ])
         
+        invoice_sent = False
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -537,8 +536,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=admin_markup
             )
+            invoice_sent = True
         except Exception as e:
             logging.error(f"Failed to send deposit invoice to admin: {e}")
+            # 🔥 اصلاح: به کاربر اطلاع بده که ارسال فاکتور به ادمین با خطا مواجه شد
+            await update.message.reply_text(
+                f"⚠️ **System Error:**\nCould not forward your invoice to the admin.\n"
+                f"Error: `{str(e)}`\n\nPlease contact support directly.",
+                parse_mode="Markdown"
+            )
+            return
+
+        if invoice_sent:
+            await update.message.reply_text(
+                "⏳ **Transaction Submitted!**\n\n"
+                "Your payment invoice and transaction hash have been sent to the admin for verification. "
+                "You will be notified as soon as it is approved.",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard(user_id)
+            )
         return
 
     # ==========================================
@@ -894,7 +910,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "ONLINE 🟢" if config_db["active"] else "OFFLINE 🔴"
         await update.message.reply_text(f"🤖 Bot Status: **{status}**", parse_mode="Markdown")
         return
-        # ==========================================
+
+# ==========================================
 # مدیریت دریافت فایل‌ها
 # ==========================================
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
