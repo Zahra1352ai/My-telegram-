@@ -23,7 +23,7 @@ from telegram.ext import (
 from faker import Faker
 
 # ==========================================
-# تنظیمات ثبت خطا (Logging)
+# Logging Configuration
 # ==========================================
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
@@ -31,7 +31,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logging.error(f"⚠️ Unexpected Bot Error: {context.error}", exc_info=context.error)
 
 # ==========================================
-# سرور وب جهت بیدار نگه داشتن ربات روی Render
+# Web Server to keep the bot alive on Render
 # ==========================================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -56,17 +56,17 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # ==========================================
-# تنظیمات اصلی ربات (توکن و ادمین)
+# Main Bot Configuration (Token & Admin)
 # ==========================================
 TOKEN = "9009320488:AAEaG0F-yEKLuoKpiS_nRWC8sActNEeKJc0"
 ADMIN_ID = 8093069505
-SUPPORT_USERNAME = "@GlobalNumSupport" # برای دکمه پشتیبانی
+SUPPORT_USERNAME = "@GlobalNumSupport" # For support button
 
 fake_en = Faker('en_US')
 fake_zh = Faker('zh_CN')
 
 # ==========================================
-# مدیریت پایگاه داده (SQLite)
+# SQLite Database Management
 # ==========================================
 DB_FILE = "bot_database.db"
 
@@ -110,7 +110,7 @@ def save_db(name, data_obj):
 async def save_db_async(name, data_obj):
     await asyncio.to_thread(save_db, name, data_obj)
 
-# بارگذاری جداول دیتابیس
+# Load database tables
 data = load_db("data", {"USA": [], "China": [], "used_names": []})
 users_db = load_db("users", {})
 config_db = load_db("config", {
@@ -125,7 +125,7 @@ admin_states = {}
 user_deposit_amounts = {}
 
 # ==========================================
-# توابع کمکی (پشتیبان‌گیری، نام تصادفی، پردازش خط)
+# Helper Functions (Backup, Random Name, Line Processing)
 # ==========================================
 def create_backup_zip():
     backup_filename = "database_backup.zip"
@@ -176,26 +176,26 @@ def get_user_record(user_id):
             "ref_earnings": 0.0,
             "referred_by": None,
             "deposit_history": [],
-            "canceled_count": 0  # 🔥 اضافه شد
+            "canceled_count": 0  # 🔥 Added
         }
         save_db("users", users_db)
-    # برای کاربران قدیمی که این فیلد را ندارند:
+    # For old users who don't have this field:
     if "canceled_count" not in users_db[u_str]:
         users_db[u_str]["canceled_count"] = 0
     return users_db[u_str]
 
 # ==========================================
-# گزارش شبانه — فقط تعداد شماره و کد گرفته (بدون هیچ عدد پولی)
+# Nightly Report — Only number counts and OTP received (No financial numbers)
 # ==========================================
 def build_nightly_report():
-    """گزارش شبانه فقط بر اساس تعداد شماره و کد گرفته — بدون هیچ عدد پولی"""
+    """Nightly report based only on number counts and OTPs — no financial numbers"""
     now_ts = time.time()
     day_ago = now_ts - (24 * 3600)
     
     iran_tz = timezone(timedelta(hours=3, minutes=30))
     now_str = datetime.now(iran_tz).strftime("%Y-%m-%d %H:%M")
     
-    lines = [f"📊 **گزارش شبانه — {now_str} (به وقت ایران)**", "━━━━━━━━━━━━━━━━━━"]
+    lines = [f"📊 **Nightly Report — {now_str} (Iran Time)**", "━━━━━━━━━━━━━━━━━━"]
     
     total_otp = 0
     total_assigned = 0
@@ -204,20 +204,20 @@ def build_nightly_report():
     for country in ["USA", "China"]:
         flag = "🇺🇸" if country == "USA" else "🇨🇳"
         
-        # شماره‌هایی که در ۲۴ ساعت گذشته کد گرفته‌اند
+        # Numbers that received OTP in the last 24 hours
         otp_items = [
             n for n in data.get(country, [])
             if n.get("status") == "used"
             and n.get("has_code", False)
             and n.get("code_received_at", 0) >= day_ago
         ]
-        # شماره‌هایی که در ۲۴ ساعت گذشته تخصیص داده شده‌اند
+        # Numbers assigned in the last 24 hours
         assigned_items = [
             n for n in data.get(country, [])
             if n.get("status") == "used"
             and n.get("assigned_at", 0) >= day_ago
         ]
-        # شماره‌هایی که کد نگرفتند
+        # Numbers that did not receive OTP
         nocode_items = [
             n for n in assigned_items
             if not n.get("has_code", False)
@@ -229,28 +229,28 @@ def build_nightly_report():
         total_nocode += len(nocode_items)
         
         lines.append(f"{flag} **{country}:**")
-        lines.append(f"   ├ ✅ کد گرفته: `{count}`")
-        lines.append(f"   ├ 📱 تخصیص داده شده: `{len(assigned_items)}`")
-        lines.append(f"   └ ⏳ بدون کد (رفاند شده): `{len(nocode_items)}`")
+        lines.append(f"   ├ ✅ OTP Received: `{count}`")
+        lines.append(f"   ├ 📱 Assigned: `{len(assigned_items)}`")
+        lines.append(f"   └ ⏳ No OTP (Refunded): `{len(nocode_items)}`")
         lines.append("")
         
         if otp_items:
-            lines.append(f"   📋 **جزئیات {country} (کد گرفته):**")
+            lines.append(f"   📋 **{country} Details (OTP Received):**")
             for n in otp_items[-20:]:
                 t = datetime.fromtimestamp(n["code_received_at"], iran_tz).strftime("%H:%M")
                 lines.append(f"   • `{n['number']}` — {t}")
             lines.append("")
     
     lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📈 **جمع کل ۲۴ ساعت:**")
-    lines.append(f"   ├ 🔢 کل کد گرفته: `{total_otp}`")
-    lines.append(f"   ├ 📱 کل تخصیص: `{total_assigned}`")
-    lines.append(f"   └ ⏳ کل بدون کد: `{total_nocode}`")
+    lines.append(f"📈 **24-Hour Total:**")
+    lines.append(f"   ├ 🔢 Total OTP Received: `{total_otp}`")
+    lines.append(f"   ├ 📱 Total Assigned: `{total_assigned}`")
+    lines.append(f"   └ ⏳ Total No OTP: `{total_nocode}`")
     
     return "\n".join(lines)
 
 async def nightly_report_worker(application: Application):
-    """هر شب ساعت ۱۲ شب به وقت ایران گزارش می‌فرستد"""
+    """Sends a report every night at 12:00 AM Iran Time"""
     while True:
         iran_tz = timezone(timedelta(hours=3, minutes=30))
         now = datetime.now(iran_tz)
@@ -273,21 +273,21 @@ async def nightly_report_worker(application: Application):
             logging.error(f"Nightly report error: {e}")
 
 # ==========================================
-# گزارش کامل کاربران
+# Full User Report
 # ==========================================
 def build_user_report():
-    """گزارش کامل فعالیت تمام کاربران"""
+    """Full activity report of all users"""
     iran_tz = timezone(timedelta(hours=3, minutes=30))
     now_str = datetime.now(iran_tz).strftime("%Y-%m-%d %H:%M")
     
-    lines = [f"👥 **گزارش کامل کاربران — {now_str} (به وقت ایران)**", "━━━━━━━━━━━━━━━━━━"]
+    lines = [f"👥 **Full User Report — {now_str} (Iran Time)**", "━━━━━━━━━━━━━━━━━━"]
     
     if not users_db:
-        lines.append("❌ هیچ کاربری ثبت نشده است.")
+        lines.append("❌ No users registered yet.")
         return "\n".join(lines)
     
     for uid, u in users_db.items():
-        # شمارش وضعیت شماره‌های کاربر برای هر کشور
+        # Count user's number status for each country
         usa_used_c = usa_otp_c = usa_nocode_c = 0
         ch_used_c = ch_otp_c = ch_nocode_c = 0
         
@@ -306,23 +306,23 @@ def build_user_report():
         canceled = u.get("canceled_count", 0)
         bal = u.get("balance", 0.0)
         
-        # نمایش فقط کاربرانی که فعالیت داشته‌اند یا موجودی دارند
+        # Only show users with activity or balance
         if usa_used_c == 0 and ch_used_c == 0 and canceled == 0 and bal == 0.0:
             continue
         
         lines.append(f"🆔 **User ID:** `{uid}`")
-        lines.append(f"   ├ 💰 موجودی: `${bal:.3f}`")
-        lines.append(f"   ├ 🇺🇸 USA → خرید: `{usa_used_c}` | کد گرفته: `{usa_otp_c}` | بدون کد: `{usa_nocode_c}`")
-        lines.append(f"   ├ 🇨🇳 China → خرید: `{ch_used_c}` | کد گرفته: `{ch_otp_c}` | بدون کد: `{ch_nocode_c}`")
-        lines.append(f"   └ ❌ لغو شده: `{canceled}`")
+        lines.append(f"   ├ 💰 Balance: `${bal:.3f}`")
+        lines.append(f"   ├ 🇺🇸 USA → Purchased: `{usa_used_c}` | OTP: `{usa_otp_c}` | No OTP: `{usa_nocode_c}`")
+        lines.append(f"   ├ 🇨🇳 China → Purchased: `{ch_used_c}` | OTP: `{ch_otp_c}` | No OTP: `{ch_nocode_c}`")
+        lines.append(f"   └ ❌ Canceled: `{canceled}`")
         lines.append("")
     
     lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📊 **جمع کل کاربران فعال:** `{len(users_db)}`")
+    lines.append(f"📊 **Total Active Users:** `{len(users_db)}`")
     return "\n".join(lines)
 
 # ==========================================
-# بک‌گراند چک‌کننده خودکار ۱۵ دقیقه‌ای برای لغو و استرداد وجه
+# Background Auto-Refund Worker (15-minute timeout)
 # ==========================================
 async def auto_refund_worker(application: Application):
     while True:
@@ -361,7 +361,7 @@ async def auto_refund_worker(application: Application):
             logging.error(f"Error in auto_refund_worker: {e}")
 
 # ==========================================
-# کیبوردهای ثابت (Reply Keyboards)
+# Reply Keyboards
 # ==========================================
 def get_main_keyboard(user_id):
     keys = [
@@ -377,7 +377,7 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Add Numbers", "💰 Manage Balance"],
         ["💵 Set Prices", "🏦 Set USDT Wallet"],
-        ["📊 Statistics", "👥 User Report"],  # 🔥 دکمه جدید
+        ["📊 Statistics", "👥 User Report"],
         ["🗑 Delete", "📥 Export"],
         ["📢 Broadcast", "⚙️ System Toggle"],
         ["📁 Send Database", "🔙 User Menu"]
@@ -420,7 +420,7 @@ def get_cancel_user_keyboard():
     return ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
 
 # ==========================================
-# ساخت منوی شیشه‌ای
+# Inline Keyboard Builder
 # ==========================================
 def build_country_selection_markup():
     prices = config_db.get("prices", {"USA": 0.175, "China": 0.195})
@@ -438,7 +438,7 @@ def build_country_selection_markup():
     return InlineKeyboardMarkup(buttons)
 
 # ==========================================
-# هندلرهای دستورات و پیام‌های متنی
+# Command & Text Message Handlers
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -496,7 +496,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = admin_states.get(user_id)
 
     # ==========================================
-    # 🔥 اصلاح: استثنا کردن مراحل واریز از بررسی Maintenance و Ban
+    # 🔥 Fix: Exclude deposit steps from Maintenance and Ban check
     # ==========================================
     is_deposit_step = state in ["WAITING_DEPOSIT_AMOUNT", "WAITING_DEPOSIT_HASH"]
 
@@ -524,7 +524,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================================
-    # بخش افزایش اعتبار (Deposit Flow)
+    # Deposit Flow
     # ==========================================
     if text == "💼 Deposit":
         markup = InlineKeyboardMarkup([
@@ -560,7 +560,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = user_deposit_amounts.pop(user_id, 0.0)
         admin_states.pop(user_id, None)
         
-        # 🔥 اصلاح: پیام موفقیت را بعد از ارسال فاکتور بفرست
         user_obj = update.message.from_user
         username_str = f"@{user_obj.username}" if user_obj.username else "No Username"
         
@@ -592,7 +591,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             invoice_sent = True
         except Exception as e:
             logging.error(f"Failed to send deposit invoice to admin: {e}")
-            # 🔥 اصلاح: به کاربر اطلاع بده که ارسال فاکتور به ادمین با خطا مواجه شد
             await update.message.reply_text(
                 f"⚠️ **System Error:**\nCould not forward your invoice to the admin.\n"
                 f"Error: `{str(e)}`\n\nPlease contact support directly.",
@@ -611,7 +609,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================================
-    # بخش پروفایل، رفرال و پشتیبانی
+    # Profile, Referral & Support
     # ==========================================
     if text == "🆔 Profile":
         bal = u_rec.get("balance", 0.0)
@@ -682,7 +680,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================================
-    # بخش پنل مدیریت
+    # Admin Panel Section
     # ==========================================
     if user_id != ADMIN_ID:
         return
@@ -852,14 +850,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(stats_msg, parse_mode="Markdown")
 
-        # 🔥 ارسال گزارش شبانه (۲۴ ساعت گذشته) تا همین لحظه
+        # 🔥 Also send the nightly report up to this moment
         report = build_nightly_report()
         await update.message.reply_text(report, parse_mode="Markdown")
         return
 
     if text == "👥 User Report":
         report = build_user_report()
-        # اگر گزارش طولانی بود، به صورت فایل متنی بفرست
+        # If the report is too long, send as a text file
         if len(report) > 4000:
             filename = "user_report.txt"
             with open(filename, "w", encoding="utf-8") as f:
@@ -868,7 +866,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=f,
                     filename=filename,
-                    caption="👥 **User Report** (طولانی بود، به صورت فایل ارسال شد)",
+                    caption="👥 **User Report** (Too long, sent as file)",
                     parse_mode="Markdown",
                     reply_markup=get_admin_keyboard()
                 )
@@ -989,7 +987,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # ==========================================
-# مدیریت دریافت فایل‌ها
+# Document Handler
 # ==========================================
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -1053,7 +1051,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_states.pop(user_id, None)
 
 # ==========================================
-# هندلر دکمه‌های شیشه‌ای
+# Inline Callback Handler
 # ==========================================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1239,7 +1237,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         refund_amount = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
         u_rec["balance"] = round(u_rec.get("balance", 0.0) + refund_amount, 4)
-        u_rec["canceled_count"] = u_rec.get("canceled_count", 0) + 1  # 🔥 اضافه شد
+        u_rec["canceled_count"] = u_rec.get("canceled_count", 0) + 1  # 🔥 Added
         await save_db_async("users", users_db)
         
         item["status"] = "free"
@@ -1283,7 +1281,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sms_code:
                 if not item.get("has_code", False):
                     item["has_code"] = True
-                    item["code_received_at"] = time.time()  # ← برای گزارش شبانه
+                    item["code_received_at"] = time.time()  # ← for nightly report
                     paid = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
                     u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
                     u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + paid, 4)
@@ -1317,11 +1315,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # ==========================================
-# راه‌اندازی پس‌زمینه
+# Background Startup
 # ==========================================
 async def post_init(application: Application):
     asyncio.create_task(auto_refund_worker(application))
-    asyncio.create_task(nightly_report_worker(application))  # ← گزارش شبانه
+    asyncio.create_task(nightly_report_worker(application))
 
     async def periodic_backup():
         while True:
