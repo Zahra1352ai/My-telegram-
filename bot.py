@@ -31,6 +31,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logging.error(f"⚠️ Unexpected Bot Error: {context.error}", exc_info=context.error)
 
 # ==========================================
+# Mail.tm Configuration & Pool
+# ==========================================
+MAIL_TM_BASE = "https://api.mail.tm"
+mail_tm_pool = []
+
+# ==========================================
 # Web Server to keep the bot alive on Render
 # ==========================================
 class KeepAliveHandler(BaseHTTPRequestHandler):
@@ -115,14 +121,97 @@ data = load_db("data", {"USA": [], "China": [], "used_names": []})
 users_db = load_db("users", {})
 config_db = load_db("config", {
     "active": True,
-    "prices": {"USA": 0.175, "China": 0.195},
+    "prices": {"USA": 0.175, "China": 0.195, "MailTM": 0.01},
     "base_costs": {"USA": 0.100, "China": 0.120},
     "usdt_bep20_address": "0xYourDefaultUSDT_BEP20_Wallet_Address_Here",
     "total_deposits": 0.0
 })
+mail_tokens_db = load_db("mail_tokens", {})
+
+# Ensure MailTM price exists in loaded config_db
+if "prices" not in config_db:
+    config_db["prices"] = {"USA": 0.175, "China": 0.195, "MailTM": 0.01}
+elif "MailTM" not in config_db["prices"]:
+    config_db["prices"]["MailTM"] = 0.01
+    save_db("config", config_db)
 
 admin_states = {}
 user_deposit_amounts = {}
+
+# ==========================================
+# Mail.tm Functions
+# ==========================================
+async def create_mail_tm_account():
+    client_kwargs = {"timeout": 15.0}
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            domains_res = await client.get(f"{MAIL_TM_BASE}/domains")
+            if domains_res.status_code != 200:
+                return None, None
+                
+            domains = domains_res.json().get("hydra:member", [])
+            if not domains:
+                return None, None
+            domain = domains[0]["domain"]
+
+            username = f"user_{int(time.time())}_{random.randint(1000, 9999)}"
+            password = "SecurePassword123!"
+            address = f"{username}@{domain}"
+
+            reg_res = await client.post(f"{MAIL_TM_BASE}/accounts", json={
+                "address": address,
+                "password": password
+            })
+            
+            if reg_res.status_code in [200, 201]:
+                token_res = await client.post(f"{MAIL_TM_BASE}/token", json={
+                    "address": address,
+                    "password": password
+                })
+                if token_res.status_code in [200, 201]:
+                    token = token_res.json().get("token")
+                    if token:
+                        return address, token
+    except Exception as e:
+        logging.error(f"Exception in create_mail_tm_account: {e}")
+    return None, None
+
+async def prefetch_mail_tm_pool():
+    global mail_tm_pool
+    while True:
+        try:
+            if len(mail_tm_pool) < 5:
+                addr, token = await create_mail_tm_account()
+                if addr and token:
+                    mail_tm_pool.append({"address": addr, "token": token})
+        except Exception as e:
+            logging.error(f"Error in prefetch pool: {e}")
+        await asyncio.sleep(2)
+
+async def check_mail_tm_code(token):
+    client_kwargs = {"timeout": 15.0}
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            headers = {"Authorization": f"Bearer {token}"}
+            messages_res = await client.get(f"{MAIL_TM_BASE}/messages", headers=headers)
+            
+            if messages_res.status_code != 200:
+                return None
+                
+            messages = messages_res.json().get("hydra:member", [])
+            if messages:
+                msg_id = messages[0]["id"]
+                msg_res = await client.get(f"{MAIL_TM_BASE}/messages/{msg_id}", headers=headers)
+                if msg_res.status_code == 200:
+                    msg_data = msg_res.json()
+                    content = msg_data.get("text", "") or msg_data.get("intro", "")
+                    
+                    codes = re.findall(r'\b\d{5,6}\b', content)
+                    if codes:
+                        return codes[-1]
+    except Exception as e:
+        logging.error(f"Exception in check_mail_tm_code: {e}")
+    return None
 
 # ==========================================
 # Helper Functions (Backup, Random Name, Line Processing)
@@ -176,10 +265,9 @@ def get_user_record(user_id):
             "ref_earnings": 0.0,
             "referred_by": None,
             "deposit_history": [],
-            "canceled_count": 0  # 🔥 Added
+            "canceled_count": 0
         }
         save_db("users", users_db)
-    # For old users who don't have this field:
     if "canceled_count" not in users_db[u_str]:
         users_db[u_str]["canceled_count"] = 0
     return users_db[u_str]
@@ -204,20 +292,17 @@ def build_nightly_report():
     for country in ["USA", "China"]:
         flag = "🇺🇸" if country == "USA" else "🇨🇳"
         
-        # Numbers that received OTP in the last 24 hours
         otp_items = [
             n for n in data.get(country, [])
             if n.get("status") == "used"
             and n.get("has_code", False)
             and n.get("code_received_at", 0) >= day_ago
         ]
-        # Numbers assigned in the last 24 hours
         assigned_items = [
             n for n in data.get(country, [])
             if n.get("status") == "used"
             and n.get("assigned_at", 0) >= day_ago
         ]
-        # Numbers that did not receive OTP
         nocode_items = [
             n for n in assigned_items
             if not n.get("has_code", False)
@@ -287,7 +372,6 @@ def build_user_report():
         return "\n".join(lines)
     
     for uid, u in users_db.items():
-        # Count user's number status for each country
         usa_used_c = usa_otp_c = usa_nocode_c = 0
         ch_used_c = ch_otp_c = ch_nocode_c = 0
         
@@ -306,7 +390,6 @@ def build_user_report():
         canceled = u.get("canceled_count", 0)
         bal = u.get("balance", 0.0)
         
-        # Only show users with activity or balance
         if usa_used_c == 0 and ch_used_c == 0 and canceled == 0 and bal == 0.0:
             continue
         
@@ -365,9 +448,9 @@ async def auto_refund_worker(application: Application):
 # ==========================================
 def get_main_keyboard(user_id):
     keys = [
-        ["⚡ Buy Number", "💼 Deposit"],
-        ["🆔 Profile", "🎁 Refer & Earn"],
-        ["👀 Support"]
+        ["⚡ Buy Number", "📧 Mail.tm Email"],
+        ["💼 Deposit", "🆔 Profile"],
+        ["🎁 Refer & Earn", "👀 Support"]
     ]
     if user_id == ADMIN_ID:
         keys.append(["⚙️ Admin Panel"])
@@ -392,7 +475,8 @@ def get_country_upload_keyboard():
 def get_price_country_keyboard():
     return ReplyKeyboardMarkup([
         ["🇺🇸 Set USA Price", "🇨🇳 Set China Price"],
-        ["💲 Set Base Costs", "🔙 Back to Admin"]
+        ["📧 Set Mail.tm Price", "💲 Set Base Costs"],
+        ["🔙 Back to Admin"]
     ], resize_keyboard=True)
 
 def get_delete_keyboard():
@@ -423,7 +507,7 @@ def get_cancel_user_keyboard():
 # Inline Keyboard Builder
 # ==========================================
 def build_country_selection_markup():
-    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195})
+    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
     usa_free = len([n for n in data.get("USA", []) if n.get("status") == "free"])
     china_free = len([n for n in data.get("China", []) if n.get("status") == "free"])
     
@@ -464,7 +548,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 **Welcome, {user.first_name}!**\n\n"
-        f"⚡ Instant Virtual Numbers & Automated OTP Delivery.\n"
+        f"⚡ Instant Virtual Numbers, Temp Emails & Automated OTP Delivery.\n"
         f"Select an option from the menu below:"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_keyboard(user_id))
@@ -495,9 +579,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = admin_states.get(user_id)
 
-    # ==========================================
-    # 🔥 Fix: Exclude deposit steps from Maintenance and Ban check
-    # ==========================================
     is_deposit_step = state in ["WAITING_DEPOSIT_AMOUNT", "WAITING_DEPOSIT_HASH"]
 
     if user_id != ADMIN_ID and not is_deposit_step:
@@ -521,6 +602,68 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🔙 Back to Admin" and user_id == ADMIN_ID:
         admin_states.pop(user_id, None)
         await update.message.reply_text("⚙️ Admin Panel:", reply_markup=get_admin_keyboard())
+        return
+
+    # ==========================================
+    # Mail.tm Email Purchase Flow
+    # ==========================================
+    if text == "📧 Mail.tm Email":
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
+        price = prices.get("MailTM", 0.01)
+
+        if u_rec.get("balance", 0.0) < price:
+            await update.message.reply_text(
+                f"❌ **Insufficient Balance!**\n\n"
+                f"💵 **Email Price:** `${price:.3f} USD`\n"
+                f"💰 **Your Balance:** `${u_rec.get('balance', 0.0):.3f} USD`\n\n"
+                f"Please top up your account via **💼 Deposit**.",
+                parse_mode="Markdown"
+            )
+            return
+
+        email_addr, mail_token = None, None
+        if mail_tm_pool:
+            item = mail_tm_pool.pop(0)
+            email_addr, mail_token = item["address"], item["token"]
+        else:
+            wait_msg = await update.message.reply_text("⏳ Generating fresh Mail.tm address...")
+            email_addr, mail_token = await create_mail_tm_account()
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+
+        if email_addr and mail_token:
+            u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
+            u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
+            u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
+            await save_db_async("users", users_db)
+
+            req_key = f"mtm_{int(time.time())}_{random.randint(1000, 9999)}"
+            mail_tokens_db[req_key] = {
+                "token": mail_token,
+                "email": email_addr,
+                "user_id": user_id,
+                "attempts": 0,
+                "price": price,
+                "codes": []
+            }
+            await save_db_async("mail_tokens", mail_tokens_db)
+
+            msg = (
+                f"📧 **Mail.tm Temporary Email**\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✉️ **Email:** `{email_addr}`\n"
+                f"💵 **Price:** `${price:.3f} USD`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 *Tap the email above to copy, request your verification code, then press* **Get Code** *below (up to 2 codes per email).*"
+            )
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Get Code", callback_data=f"mtm_code_{req_key}")]
+            ])
+            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
+        else:
+            await update.message.reply_text("❌ Failed to generate a Mail.tm address right now. No balance was deducted. Please try again.")
         return
 
     # ==========================================
@@ -624,7 +767,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 **User ID:** `{user_id}`\n"
             f"📩 **Name:** {update.message.from_user.first_name}\n"
             f"💰 **Balance:** {bal:.3f} USDT\n"
-            f"👑 **Total Purchased:** {purchased} numbers\n"
+            f"👑 **Total Purchased:** {purchased} items\n"
             f"💵 **Total Spent:** {spent:.3f} USDT\n"
             f"📊 **Referrals:** {refs} ({ref_earn:.3f} USDT earned)"
         )
@@ -758,17 +901,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "💵 Set Prices":
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195})
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
         base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120})
         await update.message.reply_text(
-            f"💵 **Current Prices:**\n🇺🇸 USA: `${prices['USA']:.3f}` (Cost: ${base_costs['USA']:.3f})\n🇨🇳 China: `${prices['China']:.3f}` (Cost: ${base_costs['China']:.3f})\n\nSelect an option:",
+            f"💵 **Current Prices:**\n"
+            f"🇺🇸 USA: `${prices.get('USA', 0.175):.3f}` (Cost: ${base_costs['USA']:.3f})\n"
+            f"🇨🇳 China: `${prices.get('China', 0.195):.3f}` (Cost: ${base_costs['China']:.3f})\n"
+            f"📧 Mail.tm: `${prices.get('MailTM', 0.01):.3f}`\n\n"
+            f"Select an option:",
             parse_mode="Markdown",
             reply_markup=get_price_country_keyboard()
         )
         return
 
-    if text in ["🇺🇸 Set USA Price", "🇨🇳 Set China Price"]:
-        c_key = "USA" if "USA" in text else "China"
+    if text in ["🇺🇸 Set USA Price", "🇨🇳 Set China Price", "📧 Set Mail.tm Price"]:
+        if "USA" in text:
+            c_key = "USA"
+        elif "China" in text:
+            c_key = "China"
+        else:
+            c_key = "MailTM"
         admin_states[user_id] = f"WAITING_PRICE_{c_key}"
         await update.message.reply_text(f"✍️ Enter new **Sell Price** for **{c_key}**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
@@ -777,6 +929,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c_key = state.split("_")[-1]
         try:
             new_price = float(text)
+            if new_price < 0:
+                raise ValueError
+            if "prices" not in config_db:
+                config_db["prices"] = {}
             config_db["prices"][c_key] = round(new_price, 4)
             await save_db_async("config", config_db)
             await update.message.reply_text(f"✅ **{c_key}** Price updated to `${new_price:.3f}`.", parse_mode="Markdown", reply_markup=get_admin_keyboard())
@@ -850,14 +1006,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(stats_msg, parse_mode="Markdown")
 
-        # 🔥 Also send the nightly report up to this moment
         report = build_nightly_report()
         await update.message.reply_text(report, parse_mode="Markdown")
         return
 
     if text == "👥 User Report":
         report = build_user_report()
-        # If the report is too long, send as a text file
         if len(report) > 4000:
             filename = "user_report.txt"
             with open(filename, "w", encoding="utf-8") as f:
@@ -1006,10 +1160,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(".")
             os.remove(zip_path)
-            global data, users_db, config_db
+            global data, users_db, config_db, mail_tokens_db
             data = load_db("data", {"USA": [], "China": [], "used_names": []})
             users_db = load_db("users", {})
-            config_db = load_db("config", {"active": True, "prices": {"USA": 0.175, "China": 0.195}})
+            config_db = load_db("config", {"active": True, "prices": {"USA": 0.175, "China": 0.195, "MailTM": 0.01}})
+            mail_tokens_db = load_db("mail_tokens", {})
             await status_msg.edit_text("✅ **Database restored!**", parse_mode="Markdown")
         except Exception as e:
             await status_msg.edit_text(f"❌ Restore error: {e}")
@@ -1061,6 +1216,76 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id != ADMIN_ID and (not config_db.get("active", True) or u_rec.get("banned", False)):
         await query.answer("⛔ Access denied.", show_alert=True)
+        return
+
+    # ==========================================
+    # Mail.tm Get Code Callback (Max 2 attempts)
+    # ==========================================
+    if action.startswith("mtm_code_"):
+        req_key = action.replace("mtm_code_", "")
+        item_data = mail_tokens_db.get(req_key)
+
+        if not item_data:
+            await query.answer("❌ Email session expired or not found.", show_alert=True)
+            return
+
+        if item_data.get("user_id") and item_data.get("user_id") != user_id:
+            await query.answer("⛔ Unauthorized.", show_alert=True)
+            return
+
+        attempts = item_data.get("attempts", 0)
+        if attempts >= 2:
+            await query.answer("⚠️ Maximum code checks (2) reached for this email.", show_alert=True)
+            return
+
+        mail_token = item_data["token"]
+        email_addr = item_data["email"]
+        prev_codes = item_data.get("codes", [])
+
+        code = await check_mail_tm_code(mail_token)
+
+        if code:
+            if attempts == 1 and prev_codes and code == prev_codes[-1]:
+                await query.answer("⏳ No new code arrived yet. Please wait and try again.", show_alert=True)
+                return
+
+            attempts += 1
+            prev_codes.append(code)
+            mail_tokens_db[req_key]["attempts"] = attempts
+            mail_tokens_db[req_key]["codes"] = prev_codes
+            await save_db_async("mail_tokens", mail_tokens_db)
+
+            if attempts == 1:
+                new_text = (
+                    f"📧 **Mail.tm Temporary Email**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✉️ **Email:** `{email_addr}`\n"
+                    f"🔐 **Code:** `{code}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✅ *Code received! Need a second code on this email? Click below:*"
+                )
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get Code Again", callback_data=f"mtm_code_{req_key}")]
+                ])
+            else:
+                new_text = (
+                    f"📧 **Mail.tm Temporary Email**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✉️ **Email:** `{email_addr}`\n"
+                    f"🔐 **Code 1:** `{prev_codes[0]}`\n"
+                    f"🔐 **Code 2:** `{code}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✔️ *Both codes received. This email session is now complete.*"
+                )
+                markup = None
+
+            try:
+                await query.edit_message_text(text=new_text, parse_mode="Markdown", reply_markup=markup)
+            except Exception as e:
+                logging.error(f"Edit message error in mtm_code: {e}")
+            await query.answer("✅ Code received!")
+        else:
+            await query.answer("⏳ No code received yet. Please wait a few seconds and try again.", show_alert=True)
         return
 
     if action == "deposit_bep20":
@@ -1172,7 +1397,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action.startswith("buy_country_"):
         country = action.replace("buy_country_", "")
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195})
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
         price = prices.get(country, 0.175)
         
         if u_rec.get("balance", 0.0) < price:
@@ -1237,7 +1462,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         refund_amount = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
         u_rec["balance"] = round(u_rec.get("balance", 0.0) + refund_amount, 4)
-        u_rec["canceled_count"] = u_rec.get("canceled_count", 0) + 1  # 🔥 Added
+        u_rec["canceled_count"] = u_rec.get("canceled_count", 0) + 1
         await save_db_async("users", users_db)
         
         item["status"] = "free"
@@ -1281,7 +1506,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sms_code:
                 if not item.get("has_code", False):
                     item["has_code"] = True
-                    item["code_received_at"] = time.time()  # ← for nightly report
+                    item["code_received_at"] = time.time()
                     paid = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
                     u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
                     u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + paid, 4)
@@ -1305,7 +1530,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🛒 Buy Another", callback_data=f"buy_country_{country}")]
                 ])
                 
-                await query.edit_message_text(otp_msg, parse_mode="Markdown", reply_markup=markup)
+                await context.bot.send_message(chat_id=user_id, text=otp_msg, parse_mode="Markdown", reply_markup=markup)
                 await query.answer("✅ OTP Received!")
             else:
                 code_len_str = "6-digit" if country == "China" else "5-digit"
@@ -1320,6 +1545,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     asyncio.create_task(auto_refund_worker(application))
     asyncio.create_task(nightly_report_worker(application))
+    asyncio.create_task(prefetch_mail_tm_pool())
 
     async def periodic_backup():
         while True:
