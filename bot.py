@@ -181,6 +181,94 @@ def get_user_record(user_id):
     return users_db[u_str]
 
 # ==========================================
+# گزارش شبانه — فقط تعداد شماره و کد گرفته (بدون هیچ عدد پولی)
+# ==========================================
+def build_nightly_report():
+    """گزارش شبانه فقط بر اساس تعداد شماره و کد گرفته — بدون هیچ عدد پولی"""
+    now_ts = time.time()
+    day_ago = now_ts - (24 * 3600)
+    
+    iran_tz = timezone(timedelta(hours=3, minutes=30))
+    now_str = datetime.now(iran_tz).strftime("%Y-%m-%d %H:%M")
+    
+    lines = [f"📊 **گزارش شبانه — {now_str} (به وقت ایران)**", "━━━━━━━━━━━━━━━━━━"]
+    
+    total_otp = 0
+    total_assigned = 0
+    total_nocode = 0
+    
+    for country in ["USA", "China"]:
+        flag = "🇺🇸" if country == "USA" else "🇨🇳"
+        
+        # شماره‌هایی که در ۲۴ ساعت گذشته کد گرفته‌اند
+        otp_items = [
+            n for n in data.get(country, [])
+            if n.get("status") == "used"
+            and n.get("has_code", False)
+            and n.get("code_received_at", 0) >= day_ago
+        ]
+        # شماره‌هایی که در ۲۴ ساعت گذشته تخصیص داده شده‌اند
+        assigned_items = [
+            n for n in data.get(country, [])
+            if n.get("status") == "used"
+            and n.get("assigned_at", 0) >= day_ago
+        ]
+        # شماره‌هایی که کد نگرفتند
+        nocode_items = [
+            n for n in assigned_items
+            if not n.get("has_code", False)
+        ]
+        
+        count = len(otp_items)
+        total_otp += count
+        total_assigned += len(assigned_items)
+        total_nocode += len(nocode_items)
+        
+        lines.append(f"{flag} **{country}:**")
+        lines.append(f"   ├ ✅ کد گرفته: `{count}`")
+        lines.append(f"   ├ 📱 تخصیص داده شده: `{len(assigned_items)}`")
+        lines.append(f"   └ ⏳ بدون کد (رفاند شده): `{len(nocode_items)}`")
+        lines.append("")
+        
+        if otp_items:
+            lines.append(f"   📋 **جزئیات {country} (کد گرفته):**")
+            for n in otp_items[-20:]:
+                t = datetime.fromtimestamp(n["code_received_at"], iran_tz).strftime("%H:%M")
+                lines.append(f"   • `{n['number']}` — {t}")
+            lines.append("")
+    
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📈 **جمع کل ۲۴ ساعت:**")
+    lines.append(f"   ├ 🔢 کل کد گرفته: `{total_otp}`")
+    lines.append(f"   ├ 📱 کل تخصیص: `{total_assigned}`")
+    lines.append(f"   └ ⏳ کل بدون کد: `{total_nocode}`")
+    
+    return "\n".join(lines)
+
+async def nightly_report_worker(application: Application):
+    """هر شب ساعت ۱۲ شب به وقت ایران گزارش می‌فرستد"""
+    while True:
+        iran_tz = timezone(timedelta(hours=3, minutes=30))
+        now = datetime.now(iran_tz)
+        
+        target = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        
+        try:
+            report = build_nightly_report()
+            await application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=report,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Nightly report error: {e}")
+
+# ==========================================
 # بک‌گراند چک‌کننده خودکار ۱۵ دقیقه‌ای برای لغو و استرداد وجه
 # ==========================================
 async def auto_refund_worker(application: Application):
@@ -314,7 +402,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⛔ You have been banned from using this bot.")
             return
 
-    # پروسه رفرال (اگر کاربر جدید باشد و از طریق لینک دعوت آمده باشد)
     if len(context.args) > 0 and u_rec.get("referred_by") is None and str(user_id) not in users_db.get("dummy", {}):
         referrer_id = context.args[0]
         if referrer_id != str(user_id) and referrer_id in users_db:
@@ -397,7 +484,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_deposit_amounts[user_id] = round(amount, 4)
             admin_states[user_id] = "WAITING_DEPOSIT_HASH"
             
-            # پیام دریافت هش تراکنش
             msg = "💯 Now enter your Order ID / Transaction Hash (TxID):"
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel", callback_data="cancel_deposit_inline")]
@@ -416,7 +502,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = user_deposit_amounts.pop(user_id, 0.0)
         admin_states.pop(user_id, None)
         
-        # پیام انتظار تایید (پیام جدید)
         await update.message.reply_text(
             "⏳ **Transaction Submitted!**\n\n"
             "Your payment invoice and transaction hash have been sent to the admin for verification. "
@@ -428,7 +513,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_obj = update.message.from_user
         username_str = f"@{user_obj.username}" if user_obj.username else "No Username"
         
-        # فاکتور ادمین
         admin_invoice = (
             f"🔔 **NEW DEPOSIT REQUEST**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -538,8 +622,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_states.pop(user_id, None)
         await update.message.reply_text("⚙️ **Welcome to Admin Panel:**", parse_mode="Markdown", reply_markup=get_admin_keyboard())
         return
-        
-    # (سایر بخش‌های ادمین عینا مشابه کد قبلی شما هستند و نیازی به تغییر نداشتند)
+
     if text == "🏦 Set USDT Wallet":
         current_wallet = config_db.get("usdt_bep20_address", "Not Set")
         admin_states[user_id] = "WAITING_USDT_WALLET"
@@ -811,8 +894,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "ONLINE 🟢" if config_db["active"] else "OFFLINE 🔴"
         await update.message.reply_text(f"🤖 Bot Status: **{status}**", parse_mode="Markdown")
         return
-
-# ==========================================
+        # ==========================================
 # مدیریت دریافت فایل‌ها
 # ==========================================
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -926,7 +1008,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         config_db["total_deposits"] = round(config_db.get("total_deposits", 0.0) + amount, 4)
         
-        # محاسبه کمیسیون رفرال
         if target_rec.get("referred_by"):
             ref_id = target_rec["referred_by"]
             if ref_id in users_db:
@@ -993,7 +1074,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not orders:
             await query.answer("You have no orders yet.", show_alert=True)
         else:
-            orders_text = "\n".join(orders[-10:]) # نمایش 10 سفارش آخر
+            orders_text = "\n".join(orders[-10:])
             await query.answer(f"Your recent orders:\n\n{orders_text}", show_alert=True)
         return
 
@@ -1107,6 +1188,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sms_code:
                 if not item.get("has_code", False):
                     item["has_code"] = True
+                    item["code_received_at"] = time.time()  # ← برای گزارش شبانه
                     paid = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
                     u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
                     u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + paid, 4)
@@ -1144,6 +1226,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 async def post_init(application: Application):
     asyncio.create_task(auto_refund_worker(application))
+    asyncio.create_task(nightly_report_worker(application))  # ← گزارش شبانه
 
     async def periodic_backup():
         while True:
