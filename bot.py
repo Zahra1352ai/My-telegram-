@@ -175,9 +175,13 @@ def get_user_record(user_id):
             "referrals": 0,
             "ref_earnings": 0.0,
             "referred_by": None,
-            "deposit_history": []
+            "deposit_history": [],
+            "canceled_count": 0  # 🔥 اضافه شد
         }
         save_db("users", users_db)
+    # برای کاربران قدیمی که این فیلد را ندارند:
+    if "canceled_count" not in users_db[u_str]:
+        users_db[u_str]["canceled_count"] = 0
     return users_db[u_str]
 
 # ==========================================
@@ -269,6 +273,55 @@ async def nightly_report_worker(application: Application):
             logging.error(f"Nightly report error: {e}")
 
 # ==========================================
+# گزارش کامل کاربران
+# ==========================================
+def build_user_report():
+    """گزارش کامل فعالیت تمام کاربران"""
+    iran_tz = timezone(timedelta(hours=3, minutes=30))
+    now_str = datetime.now(iran_tz).strftime("%Y-%m-%d %H:%M")
+    
+    lines = [f"👥 **گزارش کامل کاربران — {now_str} (به وقت ایران)**", "━━━━━━━━━━━━━━━━━━"]
+    
+    if not users_db:
+        lines.append("❌ هیچ کاربری ثبت نشده است.")
+        return "\n".join(lines)
+    
+    for uid, u in users_db.items():
+        # شمارش وضعیت شماره‌های کاربر برای هر کشور
+        usa_used_c = usa_otp_c = usa_nocode_c = 0
+        ch_used_c = ch_otp_c = ch_nocode_c = 0
+        
+        for country in ["USA", "China"]:
+            for n in data.get(country, []):
+                if n.get("user_id") == int(uid) and n.get("status") == "used":
+                    if country == "USA":
+                        usa_used_c += 1
+                        if n.get("has_code"): usa_otp_c += 1
+                        else: usa_nocode_c += 1
+                    else:
+                        ch_used_c += 1
+                        if n.get("has_code"): ch_otp_c += 1
+                        else: ch_nocode_c += 1
+        
+        canceled = u.get("canceled_count", 0)
+        bal = u.get("balance", 0.0)
+        
+        # نمایش فقط کاربرانی که فعالیت داشته‌اند یا موجودی دارند
+        if usa_used_c == 0 and ch_used_c == 0 and canceled == 0 and bal == 0.0:
+            continue
+        
+        lines.append(f"🆔 **User ID:** `{uid}`")
+        lines.append(f"   ├ 💰 موجودی: `${bal:.3f}`")
+        lines.append(f"   ├ 🇺🇸 USA → خرید: `{usa_used_c}` | کد گرفته: `{usa_otp_c}` | بدون کد: `{usa_nocode_c}`")
+        lines.append(f"   ├ 🇨🇳 China → خرید: `{ch_used_c}` | کد گرفته: `{ch_otp_c}` | بدون کد: `{ch_nocode_c}`")
+        lines.append(f"   └ ❌ لغو شده: `{canceled}`")
+        lines.append("")
+    
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📊 **جمع کل کاربران فعال:** `{len(users_db)}`")
+    return "\n".join(lines)
+
+# ==========================================
 # بک‌گراند چک‌کننده خودکار ۱۵ دقیقه‌ای برای لغو و استرداد وجه
 # ==========================================
 async def auto_refund_worker(application: Application):
@@ -324,10 +377,10 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Add Numbers", "💰 Manage Balance"],
         ["💵 Set Prices", "🏦 Set USDT Wallet"],
-        ["📊 Statistics", "🗑 Delete"],
-        ["📥 Export", "📢 Broadcast"],
-        ["⚙️ System Toggle", "📁 Send Database"],
-        ["🔙 User Menu"]
+        ["📊 Statistics", "👥 User Report"],  # 🔥 دکمه جدید
+        ["🗑 Delete", "📥 Export"],
+        ["📢 Broadcast", "⚙️ System Toggle"],
+        ["📁 Send Database", "🔙 User Menu"]
     ], resize_keyboard=True)
 
 def get_country_upload_keyboard():
@@ -798,6 +851,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   └ **Net Profit:** `${net_profit:.3f} USD`"
         )
         await update.message.reply_text(stats_msg, parse_mode="Markdown")
+
+        # 🔥 ارسال گزارش شبانه (۲۴ ساعت گذشته) تا همین لحظه
+        report = build_nightly_report()
+        await update.message.reply_text(report, parse_mode="Markdown")
+        return
+
+    if text == "👥 User Report":
+        report = build_user_report()
+        # اگر گزارش طولانی بود، به صورت فایل متنی بفرست
+        if len(report) > 4000:
+            filename = "user_report.txt"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(report)
+            with open(filename, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=filename,
+                    caption="👥 **User Report** (طولانی بود، به صورت فایل ارسال شد)",
+                    parse_mode="Markdown",
+                    reply_markup=get_admin_keyboard()
+                )
+            os.remove(filename)
+        else:
+            await update.message.reply_text(report, parse_mode="Markdown", reply_markup=get_admin_keyboard())
         return
 
     if text == "🗑 Delete":
@@ -1162,6 +1239,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         refund_amount = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
         u_rec["balance"] = round(u_rec.get("balance", 0.0) + refund_amount, 4)
+        u_rec["canceled_count"] = u_rec.get("canceled_count", 0) + 1  # 🔥 اضافه شد
         await save_db_async("users", users_db)
         
         item["status"] = "free"
