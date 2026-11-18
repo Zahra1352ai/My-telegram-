@@ -58,9 +58,9 @@ threading.Thread(target=run_web_server, daemon=True).start()
 # ==========================================
 # تنظیمات اصلی ربات (توکن و ادمین)
 # ==========================================
-TOKEN = "8774106299:AAEADqQuAc3OKWnjbe0pla73IXNwlLomZqI"
+TOKEN = "9009320488:AAEaG0F-yEKLuoKpiS_nRWC8sActNEeKJc0"
 ADMIN_ID = 8093069505
-SUPPORT_USERNAME = "@OmniVerifSupport" # برای دکمه پشتیبانی
+SUPPORT_USERNAME = "@GlobalNumSupport" # برای دکمه پشتیبانی
 
 fake_en = Faker('en_US')
 fake_zh = Faker('zh_CN')
