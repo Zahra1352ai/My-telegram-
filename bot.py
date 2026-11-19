@@ -117,7 +117,9 @@ async def save_db_async(name, data_obj):
     await asyncio.to_thread(save_db, name, data_obj)
 
 # Load database tables
-data = load_db("data", {"USA": [], "China": [], "used_names": []})
+data = load_db("data", {"USA": [], "China": [], "used_names": [], "canceled": []})
+if "canceled" not in data:
+    data["canceled"] = []
 users_db = load_db("users", {})
 config_db = load_db("config", {
     "active": True,
@@ -216,11 +218,30 @@ async def check_mail_tm_code(token):
 # ==========================================
 # Helper Functions (Backup, Random Name, Line Processing)
 # ==========================================
+def save_all_dbs():
+    save_db("data", data)
+    save_db("users", users_db)
+    save_db("config", config_db)
+    save_db("mail_tokens", mail_tokens_db)
+
+async def save_all_dbs_async():
+    await asyncio.to_thread(save_all_dbs)
+
 def create_backup_zip():
+    save_all_dbs()
     backup_filename = "database_backup.zip"
+    snapshot_db = "snapshot_bot_database.db"
     if os.path.exists(DB_FILE):
+        src_conn = sqlite3.connect(DB_FILE)
+        dst_conn = sqlite3.connect(snapshot_db)
+        with dst_conn:
+            src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
         with zipfile.ZipFile(backup_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(DB_FILE)
+            zipf.write(snapshot_db, arcname=DB_FILE)
+        if os.path.exists(snapshot_db):
+            os.remove(snapshot_db)
     return backup_filename
 
 async def get_unique_name(country):
@@ -440,6 +461,14 @@ async def auto_refund_worker(application: Application):
                                 refund_amount = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
                                 u_rec["balance"] = round(u_rec.get("balance", 0.0) + refund_amount, 4)
                                 
+                                data.setdefault("canceled", []).append({
+                                    "country": country,
+                                    "number": item.get("number", ""),
+                                    "link": item.get("link", ""),
+                                    "user_id": user_id,
+                                    "reason": "auto_refund_15m",
+                                    "ts": current_time
+                                })
                                 item["status"] = "free"
                                 item["user_id"] = None
                                 item["assigned_at"] = 0
@@ -456,6 +485,7 @@ async def auto_refund_worker(application: Application):
                                 except Exception:
                                     pass
             if updated:
+                await save_db_async("config", config_db)
                 await save_db_async("users", users_db)
                 await save_db_async("data", data)
         except Exception as e:
@@ -505,8 +535,8 @@ def get_delete_keyboard():
 
 def get_export_keyboard():
     return ReplyKeyboardMarkup([
-        ["✅ Used Numbers", "🆓 Free Numbers"],
-        ["⏳ No-OTP Numbers", "🔙 Back to Admin"]
+        ["✅ OTP Received", "⏳ No OTP"],
+        ["❌ Canceled", "🔙 Back to Admin"]
     ], resize_keyboard=True)
 
 def get_target_keyboard():
@@ -874,7 +904,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📁 Send Database":
         try:
-            backup_filename = create_backup_zip()
+            backup_filename = await asyncio.to_thread(create_backup_zip)
             if os.path.exists(backup_filename):
                 with open(backup_filename, "rb") as f:
                     await update.message.reply_document(document=f, filename=backup_filename, caption="📁 Database Backup", reply_markup=get_admin_keyboard())
@@ -1086,32 +1116,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state == "EXPORT_MENU":
-        if text == "✅ Used Numbers":
-            admin_states[user_id] = "EXPORT_USED"
-            await update.message.reply_text("Export used numbers for which users?", reply_markup=get_target_keyboard())
-        elif text == "🆓 Free Numbers":
-            export_lines = []
-            for country in ["USA", "China"]:
-                for item in data.get(country, []):
-                    if item.get("status") == "free":
-                        export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
-            await send_export_file(update, export_lines, "free_numbers.txt")
-            admin_states.pop(user_id, None)
-        elif text == "⏳ No-OTP Numbers":
+        if text == "✅ OTP Received":
+            admin_states[user_id] = "EXPORT_OTP"
+            await update.message.reply_text("Export OTP-received numbers for which users?", reply_markup=get_target_keyboard())
+        elif text == "⏳ No OTP":
             admin_states[user_id] = "EXPORT_NOCODE"
             await update.message.reply_text("Export No-OTP numbers for which users?", reply_markup=get_target_keyboard())
+        elif text == "❌ Canceled":
+            admin_states[user_id] = "EXPORT_CANCELED"
+            await update.message.reply_text("Export canceled numbers for which users?", reply_markup=get_target_keyboard())
         return
 
-    if state in ["EXPORT_USED", "EXPORT_NOCODE"]:
+    if state in ["EXPORT_OTP", "EXPORT_NOCODE", "EXPORT_CANCELED"]:
         if text == "🌐 All Users":
             export_lines = []
-            is_nocode = (state == "EXPORT_NOCODE")
-            for country in ["USA", "China"]:
-                for item in data.get(country, []):
-                    if item.get("status") == "used":
-                        if not is_nocode or not item.get("has_code", False):
+            if state == "EXPORT_OTP":
+                for country in ["USA", "China"]:
+                    for item in data.get(country, []):
+                        if item.get("status") == "used" and item.get("has_code", False):
                             export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
-            await send_export_file(update, export_lines, "all_nocode.txt" if is_nocode else "all_used.txt")
+                await send_export_file(update, export_lines, "otp_received.txt")
+            elif state == "EXPORT_NOCODE":
+                for country in ["USA", "China"]:
+                    for item in data.get(country, []):
+                        if item.get("status") == "used" and not item.get("has_code", False):
+                            export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
+                await send_export_file(update, export_lines, "no_otp.txt")
+            elif state == "EXPORT_CANCELED":
+                for item in data.get("canceled", []):
+                    export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
+                await send_export_file(update, export_lines, "canceled_numbers.txt")
             admin_states.pop(user_id, None)
         elif text == "👤 Specific User":
             admin_states[user_id] = f"WAITING_{state}_ID"
@@ -1122,13 +1156,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             target_id = int(text)
             export_lines = []
-            is_nocode = ("NOCODE" in state)
-            for country in ["USA", "China"]:
-                for item in data.get(country, []):
-                    if item.get("status") == "used" and item.get("user_id") == target_id:
-                        if not is_nocode or not item.get("has_code", False):
+            if "EXPORT_OTP" in state:
+                for country in ["USA", "China"]:
+                    for item in data.get(country, []):
+                        if item.get("status") == "used" and item.get("has_code", False) and item.get("user_id") == target_id:
                             export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
-            await send_export_file(update, export_lines, f"user_{target_id}.txt")
+                fname = f"user_{target_id}_otp_received.txt"
+            elif "EXPORT_NOCODE" in state:
+                for country in ["USA", "China"]:
+                    for item in data.get(country, []):
+                        if item.get("status") == "used" and not item.get("has_code", False) and item.get("user_id") == target_id:
+                            export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
+                fname = f"user_{target_id}_no_otp.txt"
+            elif "EXPORT_CANCELED" in state:
+                for item in data.get("canceled", []):
+                    if item.get("user_id") == target_id:
+                        export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
+                fname = f"user_{target_id}_canceled.txt"
+            else:
+                fname = f"user_{target_id}.txt"
+            await send_export_file(update, export_lines, fname)
         except ValueError:
             await update.message.reply_text("❌ Invalid User ID.")
         admin_states.pop(user_id, None)
@@ -1179,11 +1226,35 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 zip_ref.extractall(".")
             os.remove(zip_path)
             global data, users_db, config_db, mail_tokens_db
-            data = load_db("data", {"USA": [], "China": [], "used_names": []})
+            data = load_db("data", {"USA": [], "China": [], "used_names": [], "canceled": []})
+            if "canceled" not in data:
+                data["canceled"] = []
             users_db = load_db("users", {})
-            config_db = load_db("config", {"active": True, "prices": {"USA": 0.175, "China": 0.195, "MailTM": 0.01}})
+            config_db = load_db("config", {
+                "active": True,
+                "prices": {"USA": 0.175, "China": 0.195, "MailTM": 0.01},
+                "base_costs": {"USA": 0.100, "China": 0.120},
+                "usdt_bep20_address": "0xYourDefaultUSDT_BEP20_Wallet_Address_Here",
+                "total_deposits": 0.0
+            })
+            config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
+            config_db["prices"].setdefault("MailTM", 0.01)
+            config_db.setdefault("base_costs", {"USA": 0.100, "China": 0.120})
+            config_db.setdefault("usdt_bep20_address", "0xYourDefaultUSDT_BEP20_Wallet_Address_Here")
+            config_db.setdefault("total_deposits", 0.0)
             mail_tokens_db = load_db("mail_tokens", {})
-            await status_msg.edit_text("✅ **Database restored!**", parse_mode="Markdown")
+            await save_all_dbs_async()
+            prices = config_db["prices"]
+            wallet = config_db["usdt_bep20_address"]
+            await status_msg.edit_text(
+                f"✅ **Full Database Restored!**\n\n"
+                f"👥 Users: `{len(users_db)}`\n"
+                f"🇺🇸 USA Stock: `{len([n for n in data.get('USA', []) if n.get('status') == 'free'])}`\n"
+                f"🇨🇳 China Stock: `{len([n for n in data.get('China', []) if n.get('status') == 'free'])}`\n"
+                f"💵 Prices: USA `${prices.get('USA', 0.175):.3f}` | China `${prices.get('China', 0.195):.3f}` | Mail.tm `${prices.get('MailTM', 0.01):.3f}`\n"
+                f"🏦 Wallet: `{wallet}`",
+                parse_mode="Markdown"
+            )
         except Exception as e:
             await status_msg.edit_text(f"❌ Restore error: {e}")
         return
@@ -1490,6 +1561,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u_rec["canceled_count"] = u_rec.get("canceled_count", 0) + 1
         await save_db_async("users", users_db)
         
+        data.setdefault("canceled", []).append({
+            "country": country,
+            "number": item.get("number", ""),
+            "link": item.get("link", ""),
+            "user_id": user_id,
+            "reason": "user_canceled",
+            "ts": time.time()
+        })
         item["status"] = "free"
         item["user_id"] = None
         item["assigned_at"] = 0
@@ -1579,7 +1658,7 @@ async def post_init(application: Application):
         while True:
             await asyncio.sleep(3600)
             try:
-                backup_filename = create_backup_zip()
+                backup_filename = await asyncio.to_thread(create_backup_zip)
                 if os.path.exists(backup_filename):
                     with open(backup_filename, "rb") as f:
                         await application.bot.send_document(
