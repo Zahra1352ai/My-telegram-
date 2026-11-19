@@ -1395,8 +1395,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Your recent orders:\n\n{orders_text}", show_alert=True)
         return
 
-    if action.startswith("buy_country_"):
-        country = action.replace("buy_country_", "")
+    if action.startswith("buy_country_") or action.startswith("buy_another_"):
+        is_buy_another = action.startswith("buy_another_")
+        country = action.replace("buy_another_", "") if is_buy_another else action.replace("buy_country_", "")
         prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
         price = prices.get(country, 0.175)
         
@@ -1438,7 +1439,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ Cancel Number", callback_data=f"cancel_num_{country}_{idx}")]
         ])
         
-        await query.edit_message_text(num_msg, parse_mode="Markdown", reply_markup=markup)
+        if is_buy_another:
+            await context.bot.send_message(chat_id=user_id, text=num_msg, parse_mode="Markdown", reply_markup=markup)
+        else:
+            await query.edit_message_text(num_msg, parse_mode="Markdown", reply_markup=markup)
         await query.answer("✅ Number assigned!")
         return
 
@@ -1527,10 +1531,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 markup = InlineKeyboardMarkup([
                     [InlineKeyboardButton(f"📋 Copy OTP: {sms_code}", copy_text=CopyTextButton(text=str(sms_code)))],
-                    [InlineKeyboardButton("🛒 Buy Another", callback_data=f"buy_country_{country}")]
+                    [InlineKeyboardButton("🛒 Buy Another", callback_data=f"buy_another_{country}")]
                 ])
                 
-                await context.bot.send_message(chat_id=user_id, text=otp_msg, parse_mode="Markdown", reply_markup=markup)
+                await query.edit_message_text(text=otp_msg, parse_mode="Markdown", reply_markup=markup)
                 await query.answer("✅ OTP Received!")
             else:
                 code_len_str = "6-digit" if country == "China" else "5-digit"
