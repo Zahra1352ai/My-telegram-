@@ -1553,7 +1553,7 @@ async def post_init(application: Application):
 
     async def periodic_backup():
         while True:
-            await asyncio.sleep(6 * 3600)
+            await asyncio.sleep(3600)
             try:
                 backup_filename = create_backup_zip()
                 if os.path.exists(backup_filename):
@@ -1562,7 +1562,7 @@ async def post_init(application: Application):
                             chat_id=ADMIN_ID,
                             document=f,
                             filename=backup_filename,
-                            caption="⏰ **Automatic 6-Hour Database Backup**",
+                            caption="⏰ **Automatic 1-Hour Database Backup**",
                             parse_mode="Markdown"
                         )
             except Exception as e:
