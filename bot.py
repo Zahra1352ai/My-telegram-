@@ -273,17 +273,37 @@ def get_user_record(user_id):
     return users_db[u_str]
 
 # ==========================================
-# Nightly Report — Only number counts and OTP received (No financial numbers)
+# Nightly Report — Only 24h cycle counts (resets at 12:00 AM Iran Time)
 # ==========================================
+def get_daily_stats():
+    if "daily_stats" not in config_db:
+        config_db["daily_stats"] = {
+            "since_ts": time.time(),
+            "last_sent_date": "",
+            "USA": {"assigned": 0, "nocode": 0},
+            "China": {"assigned": 0, "nocode": 0}
+        }
+        save_db("config", config_db)
+    return config_db["daily_stats"]
+
+def reset_daily_stats(sent_date_str=""):
+    config_db["daily_stats"] = {
+        "since_ts": time.time(),
+        "last_sent_date": sent_date_str,
+        "USA": {"assigned": 0, "nocode": 0},
+        "China": {"assigned": 0, "nocode": 0}
+    }
+    save_db("config", config_db)
+
 def build_nightly_report():
-    """Nightly report based only on number counts and OTPs — no financial numbers"""
-    now_ts = time.time()
-    day_ago = now_ts - (24 * 3600)
+    """Nightly report based only on current 24h cycle (resets to 0 after 12:00 AM report)"""
+    d_stats = get_daily_stats()
+    since_ts = d_stats.get("since_ts", 0)
     
     iran_tz = timezone(timedelta(hours=3, minutes=30))
     now_str = datetime.now(iran_tz).strftime("%Y-%m-%d %H:%M")
     
-    lines = [f"📊 **Nightly Report — {now_str} (Iran Time)**", "━━━━━━━━━━━━━━━━━━"]
+    lines = [f"📊 **Nightly 24-Hour Report — {now_str} (Iran Time)**", "━━━━━━━━━━━━━━━━━━"]
     
     total_otp = 0
     total_assigned = 0
@@ -296,27 +316,22 @@ def build_nightly_report():
             n for n in data.get(country, [])
             if n.get("status") == "used"
             and n.get("has_code", False)
-            and n.get("code_received_at", 0) >= day_ago
+            and n.get("code_received_at", 0) >= since_ts
         ]
-        assigned_items = [
-            n for n in data.get(country, [])
-            if n.get("status") == "used"
-            and n.get("assigned_at", 0) >= day_ago
-        ]
-        nocode_items = [
-            n for n in assigned_items
-            if not n.get("has_code", False)
-        ]
+        
+        c_stats = d_stats.get(country, {"assigned": 0, "nocode": 0})
+        assigned_count = max(c_stats.get("assigned", 0), len(otp_items))
+        nocode_count = c_stats.get("nocode", 0)
         
         count = len(otp_items)
         total_otp += count
-        total_assigned += len(assigned_items)
-        total_nocode += len(nocode_items)
+        total_assigned += assigned_count
+        total_nocode += nocode_count
         
         lines.append(f"{flag} **{country}:**")
         lines.append(f"   ├ ✅ OTP Received: `{count}`")
-        lines.append(f"   ├ 📱 Assigned: `{len(assigned_items)}`")
-        lines.append(f"   └ ⏳ No OTP (Refunded): `{len(nocode_items)}`")
+        lines.append(f"   ├ 📱 Assigned: `{assigned_count}`")
+        lines.append(f"   └ ⏳ No OTP (Refunded/Canceled): `{nocode_count}`")
         lines.append("")
         
         if otp_items:
@@ -335,27 +350,28 @@ def build_nightly_report():
     return "\n".join(lines)
 
 async def nightly_report_worker(application: Application):
-    """Sends a report every night at 12:00 AM Iran Time"""
+    """Checks every 20 seconds so 12:00 AM Iran Time is never missed, sends report, and resets stats to 0"""
+    iran_tz = timezone(timedelta(hours=3, minutes=30))
     while True:
-        iran_tz = timezone(timedelta(hours=3, minutes=30))
-        now = datetime.now(iran_tz)
-        
-        target = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        
-        wait_seconds = (target - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-        
         try:
-            report = build_nightly_report()
-            await application.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=report,
-                parse_mode="Markdown"
-            )
+            now = datetime.now(iran_tz)
+            today_str = now.strftime("%Y-%m-%d")
+            d_stats = get_daily_stats()
+            
+            # Trigger at 00:00 (between 00:00 and 00:05) if not already sent today
+            if now.hour == 0 and now.minute < 5 and d_stats.get("last_sent_date") != today_str:
+                report = build_nightly_report()
+                await application.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=report,
+                    parse_mode="Markdown"
+                )
+                reset_daily_stats(sent_date_str=today_str)
+                await save_db_async("config", config_db)
+                logging.info(f"✅ Nightly report sent and daily stats reset for {today_str}")
         except Exception as e:
             logging.error(f"Nightly report error: {e}")
+        await asyncio.sleep(20)
 
 # ==========================================
 # Full User Report
@@ -427,6 +443,8 @@ async def auto_refund_worker(application: Application):
                                 item["status"] = "free"
                                 item["user_id"] = None
                                 item["assigned_at"] = 0
+                                d_st = get_daily_stats()
+                                d_st[country]["nocode"] = d_st[country].get("nocode", 0) + 1
                                 updated = True
                                 
                                 try:
@@ -1421,6 +1439,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item["assigned_at"] = time.time()
         item["has_code"] = False
         item["paid_price"] = price
+        d_st = get_daily_stats()
+        d_st[country]["assigned"] = d_st[country].get("assigned", 0) + 1
+        await save_db_async("config", config_db)
         await save_db_async("data", data)
 
         flag = "🇺🇸" if country == "USA" else "🇨🇳"
@@ -1472,6 +1493,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item["status"] = "free"
         item["user_id"] = None
         item["assigned_at"] = 0
+        d_st = get_daily_stats()
+        d_st[country]["nocode"] = d_st[country].get("nocode", 0) + 1
+        await save_db_async("config", config_db)
         await save_db_async("data", data)
         
         await query.edit_message_text(f"❌ **CANCELED**\n\n💰 `${refund_amount:.3f} USD` refunded.\n💵 Balance: `${u_rec['balance']:.3f} USD`", parse_mode="Markdown")
