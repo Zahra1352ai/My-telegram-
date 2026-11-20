@@ -116,29 +116,119 @@ def save_db(name, data_obj):
 async def save_db_async(name, data_obj):
     await asyncio.to_thread(save_db, name, data_obj)
 
+DEFAULT_COUNTRY_SETTINGS = {
+    "USA": {
+        "label": "🇺🇸 آمریکا",
+        "btn_text": "🇺🇸 USA +1 Telegram",
+        "upload_label": "🇺🇸 آمریکا (آپلود)",
+        "otp_digits": 5,
+        "strip_prefix": True,
+        "prefix": "1"
+    },
+    "China": {
+        "label": "🇨🇳 چین",
+        "btn_text": "🇨🇳 China +86 Telegram",
+        "upload_label": "🇨🇳 چین (آپلود)",
+        "otp_digits": 6,
+        "strip_prefix": True,
+        "prefix": "86"
+    },
+    "Canada": {
+        "label": "🇨🇦 کانادا",
+        "btn_text": "🇨🇦 کانادا (+1)",
+        "upload_label": "🇨🇦 کانادا (آپلود)",
+        "otp_digits": 5,
+        "strip_prefix": True,
+        "prefix": "1"
+    }
+}
+
 # Load database tables
-data = load_db("data", {"USA": [], "China": [], "used_names": [], "canceled": []})
+data = load_db("data", {"USA": [], "China": [], "Canada": [], "used_names": [], "canceled": []})
+for _ck in ["USA", "China", "Canada"]:
+    if _ck not in data:
+        data[_ck] = []
+if "used_names" not in data:
+    data["used_names"] = []
 if "canceled" not in data:
     data["canceled"] = []
+
 users_db = load_db("users", {})
 config_db = load_db("config", {
     "active": True,
-    "prices": {"USA": 0.175, "China": 0.195, "MailTM": 0.01},
-    "base_costs": {"USA": 0.100, "China": 0.120},
+    "prices": {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01},
+    "base_costs": {"USA": 0.100, "China": 0.120, "Canada": 0.100},
     "usdt_bep20_address": "0xYourDefaultUSDT_BEP20_Wallet_Address_Here",
-    "total_deposits": 0.0
+    "total_deposits": 0.0,
+    "country_settings": json.loads(json.dumps(DEFAULT_COUNTRY_SETTINGS)),
+    "custom_countries": {}
 })
 mail_tokens_db = load_db("mail_tokens", {})
 
-# Ensure MailTM price exists in loaded config_db
-if "prices" not in config_db:
-    config_db["prices"] = {"USA": 0.175, "China": 0.195, "MailTM": 0.01}
-elif "MailTM" not in config_db["prices"]:
-    config_db["prices"]["MailTM"] = 0.01
-    save_db("config", config_db)
+config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+config_db["prices"].setdefault("USA", 0.175)
+config_db["prices"].setdefault("China", 0.195)
+config_db["prices"].setdefault("Canada", 0.175)
+config_db["prices"].setdefault("MailTM", 0.01)
+
+config_db.setdefault("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
+config_db["base_costs"].setdefault("USA", 0.100)
+config_db["base_costs"].setdefault("China", 0.120)
+config_db["base_costs"].setdefault("Canada", 0.100)
+
+config_db.setdefault("custom_countries", {})
+config_db.setdefault("country_settings", {})
+for _bk, _bcfg in DEFAULT_COUNTRY_SETTINGS.items():
+    if _bk not in config_db["country_settings"]:
+        config_db["country_settings"][_bk] = dict(_bcfg)
+    else:
+        for _sk, _sv in _bcfg.items():
+            config_db["country_settings"][_bk].setdefault(_sk, _sv)
+
+for _ck, _ccfg in config_db["custom_countries"].items():
+    if _ck not in data:
+        data[_ck] = []
+    config_db["prices"].setdefault(_ck, _ccfg.get("price", 0.175))
+    config_db["base_costs"].setdefault(_ck, _ccfg.get("base_cost", 0.100))
+    _ccfg.setdefault("label", f"🌍 {_ck}")
+    _ccfg.setdefault("btn_text", f"{_ccfg['label']} شماره")
+    _ccfg.setdefault("upload_label", f"{_ccfg['label']} (آپلود)")
+    _ccfg.setdefault("otp_digits", 5)
+    _ccfg.setdefault("strip_prefix", False)
+    _ccfg.setdefault("prefix", "")
+
+save_db("data", data)
+save_db("config", config_db)
 
 admin_states = {}
 user_deposit_amounts = {}
+pending_new_country = {}
+
+def get_all_country_keys():
+    base = ["USA", "China", "Canada"]
+    custom = list(config_db.get("custom_countries", {}).keys())
+    return base + custom
+
+def get_country_config(country_key):
+    if country_key in config_db.get("country_settings", {}):
+        return config_db["country_settings"][country_key]
+    if country_key in config_db.get("custom_countries", {}):
+        return config_db["custom_countries"][country_key]
+    return {
+        "label": country_key,
+        "btn_text": f"🌍 {country_key}",
+        "upload_label": f"{country_key} (آپلود)",
+        "otp_digits": 5,
+        "strip_prefix": False,
+        "prefix": ""
+    }
+
+def find_country_by_upload_text(text):
+    for c_key in get_all_country_keys():
+        cfg = get_country_config(c_key)
+        if cfg.get("upload_label") == text:
+            return c_key
+    return None
 
 # ==========================================
 # Mail.tm Functions
@@ -256,7 +346,7 @@ async def get_unique_name(country):
             await save_db_async("data", data)
             return name
 
-def process_data_line(line):
+def process_data_line(line, country="USA"):
     line = line.strip()
     if not line:
         return None, None
@@ -269,6 +359,14 @@ def process_data_line(line):
     remainder = line.replace(link, "")
     phone = re.sub(r'[^\d+]', '', remainder)
     
+    cfg = get_country_config(country)
+    if cfg.get("strip_prefix", False):
+        prefix = str(cfg.get("prefix", "")).strip()
+        if prefix:
+            phone_digits_only = re.sub(r'\D', '', phone)
+            if phone_digits_only.startswith(prefix):
+                phone = phone_digits_only[len(prefix):]
+
     if not phone:
         return None, None
         
@@ -300,20 +398,21 @@ def get_daily_stats():
     if "daily_stats" not in config_db:
         config_db["daily_stats"] = {
             "since_ts": time.time(),
-            "last_sent_date": "",
-            "USA": {"assigned": 0, "nocode": 0},
-            "China": {"assigned": 0, "nocode": 0}
+            "last_sent_date": ""
         }
-        save_db("config", config_db)
+    for ck in get_all_country_keys():
+        config_db["daily_stats"].setdefault(ck, {"assigned": 0, "nocode": 0})
+    save_db("config", config_db)
     return config_db["daily_stats"]
 
 def reset_daily_stats(sent_date_str=""):
-    config_db["daily_stats"] = {
+    st = {
         "since_ts": time.time(),
-        "last_sent_date": sent_date_str,
-        "USA": {"assigned": 0, "nocode": 0},
-        "China": {"assigned": 0, "nocode": 0}
+        "last_sent_date": sent_date_str
     }
+    for ck in get_all_country_keys():
+        st[ck] = {"assigned": 0, "nocode": 0}
+    config_db["daily_stats"] = st
     save_db("config", config_db)
 
 def build_nightly_report():
@@ -330,8 +429,8 @@ def build_nightly_report():
     total_assigned = 0
     total_nocode = 0
     
-    for country in ["USA", "China"]:
-        flag = "🇺🇸" if country == "USA" else "🇨🇳"
+    for country in get_all_country_keys():
+        flag = get_country_config(country).get("label", country)
         
         otp_items = [
             n for n in data.get(country, [])
@@ -379,7 +478,6 @@ async def nightly_report_worker(application: Application):
             today_str = now.strftime("%Y-%m-%d")
             d_stats = get_daily_stats()
             
-            # Trigger at 00:00 (between 00:00 and 00:05) if not already sent today
             if now.hour == 0 and now.minute < 5 and d_stats.get("last_sent_date") != today_str:
                 report = build_nightly_report()
                 await application.bot.send_message(
@@ -409,31 +507,32 @@ def build_user_report():
         return "\n".join(lines)
     
     for uid, u in users_db.items():
-        usa_used_c = usa_otp_c = usa_nocode_c = 0
-        ch_used_c = ch_otp_c = ch_nocode_c = 0
-        
-        for country in ["USA", "China"]:
+        per_c = {}
+        any_used = False
+        for country in get_all_country_keys():
+            used_c = otp_c = nocode_c = 0
             for n in data.get(country, []):
                 if n.get("user_id") == int(uid) and n.get("status") == "used":
-                    if country == "USA":
-                        usa_used_c += 1
-                        if n.get("has_code"): usa_otp_c += 1
-                        else: usa_nocode_c += 1
+                    used_c += 1
+                    any_used = True
+                    if n.get("has_code"):
+                        otp_c += 1
                     else:
-                        ch_used_c += 1
-                        if n.get("has_code"): ch_otp_c += 1
-                        else: ch_nocode_c += 1
+                        nocode_c += 1
+            per_c[country] = (used_c, otp_c, nocode_c)
         
         canceled = u.get("canceled_count", 0)
         bal = u.get("balance", 0.0)
         
-        if usa_used_c == 0 and ch_used_c == 0 and canceled == 0 and bal == 0.0:
+        if not any_used and canceled == 0 and bal == 0.0:
             continue
         
         lines.append(f"🆔 **User ID:** `{uid}`")
         lines.append(f"   ├ 💰 Balance: `${bal:.3f}`")
-        lines.append(f"   ├ 🇺🇸 USA → Purchased: `{usa_used_c}` | OTP: `{usa_otp_c}` | No OTP: `{usa_nocode_c}`")
-        lines.append(f"   ├ 🇨🇳 China → Purchased: `{ch_used_c}` | OTP: `{ch_otp_c}` | No OTP: `{ch_nocode_c}`")
+        for country in get_all_country_keys():
+            used_c, otp_c, nocode_c = per_c[country]
+            lbl = get_country_config(country).get("label", country)
+            lines.append(f"   ├ {lbl} → Purchased: `{used_c}` | OTP: `{otp_c}` | No OTP: `{nocode_c}`")
         lines.append(f"   └ ❌ Canceled: `{canceled}`")
         lines.append("")
     
@@ -450,7 +549,7 @@ async def auto_refund_worker(application: Application):
         try:
             current_time = time.time()
             updated = False
-            for country in ["USA", "China"]:
+            for country in get_all_country_keys():
                 for item in data.get(country, []):
                     if item.get("status") == "used" and not item.get("has_code", False):
                         assigned_time = item.get("assigned_at", 0)
@@ -515,15 +614,39 @@ def get_admin_keyboard():
     ], resize_keyboard=True)
 
 def get_country_upload_keyboard():
-    return ReplyKeyboardMarkup([
-        ["🇺🇸 USA (Upload)", "🇨🇳 China (Upload)"],
-        ["🔙 Back to Admin"]
-    ], resize_keyboard=True)
+    rows = []
+    row = []
+    for c_key in get_all_country_keys():
+        cfg = get_country_config(c_key)
+        row.append(cfg.get("upload_label", f"{c_key} (آپلود)"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append(["🔙 Back to Admin"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def get_price_country_keyboard():
+    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+    rows = []
+    row = []
+    for c_key in get_all_country_keys():
+        cfg = get_country_config(c_key)
+        p_val = prices.get(c_key, 0.175)
+        row.append(f"💵 {cfg.get('label', c_key)} (${p_val:.3f})")
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([f"📧 Mail.tm (${prices.get('MailTM', 0.01):.3f})", "➕ افزودن منوی شماره جدید"])
+    rows.append(["💲 Set Base Costs", "🔙 Back to Admin"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def get_prefix_choice_keyboard():
     return ReplyKeyboardMarkup([
-        ["🇺🇸 Set USA Price", "🇨🇳 Set China Price"],
-        ["📧 Set Mail.tm Price", "💲 Set Base Costs"],
+        ["✂️ حذف پیش‌شماره", "📌 بدون حذف پیش‌شماره"],
         ["🔙 Back to Admin"]
     ], resize_keyboard=True)
 
@@ -555,16 +678,15 @@ def get_cancel_user_keyboard():
 # Inline Keyboard Builder
 # ==========================================
 def build_country_selection_markup():
-    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
-    usa_free = len([n for n in data.get("USA", []) if n.get("status") == "free"])
-    china_free = len([n for n in data.get("China", []) if n.get("status") == "free"])
-    
+    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
     buttons = []
-    if usa_free > 0:
-        buttons.append([InlineKeyboardButton(f"🇺🇸 USA +1 Telegram USD {prices['USA']:.3f}", callback_data="buy_country_USA")])
-    if china_free > 0:
-        buttons.append([InlineKeyboardButton(f"🇨🇳 China +86 Telegram USD {prices['China']:.3f}", callback_data="buy_country_China")])
-        
+    for c_key in get_all_country_keys():
+        free_cnt = len([n for n in data.get(c_key, []) if n.get("status") == "free"])
+        if free_cnt > 0:
+            cfg = get_country_config(c_key)
+            p_val = prices.get(c_key, 0.175)
+            btn_label = f"{cfg.get('btn_text', cfg.get('label', c_key))} USD {p_val:.3f}"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"buy_country_{c_key}")])
     if not buttons:
         return None
     return InlineKeyboardMarkup(buttons)
@@ -640,6 +762,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "❌ Cancel":
         admin_states.pop(user_id, None)
         user_deposit_amounts.pop(user_id, None)
+        pending_new_country.pop(user_id, None)
         await update.message.reply_text("❌ Process canceled.", reply_markup=get_main_keyboard(user_id))
         return
 
@@ -649,6 +772,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif text == "🔙 Back to Admin" and user_id == ADMIN_ID:
         admin_states.pop(user_id, None)
+        pending_new_country.pop(user_id, None)
         await update.message.reply_text("⚙️ Admin Panel:", reply_markup=get_admin_keyboard())
         return
 
@@ -656,7 +780,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Mail.tm Email Purchase Flow
     # ==========================================
     if text == "📧 Mail.tm Email":
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
         price = prices.get("MailTM", 0.01)
 
         if u_rec.get("balance", 0.0) < price:
@@ -916,8 +1040,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📂 Select country to upload numbers:", reply_markup=get_country_upload_keyboard())
         return
 
-    if text in ["🇺🇸 USA (Upload)", "🇨🇳 China (Upload)"]:
-        admin_states[user_id] = "WAITING_FILE_CHINA" if "China" in text else "WAITING_FILE_USA"
+    upload_ck = find_country_by_upload_text(text)
+    if upload_ck:
+        admin_states[user_id] = f"WAITING_FILE_{upload_ck}"
         await update.message.reply_text("📄 Please send the `.txt` file:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
 
@@ -949,32 +1074,166 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "💵 Set Prices":
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
-        base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120})
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+        base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
+        lines_p = ["💵 **Current Prices:**"]
+        for ck in get_all_country_keys():
+            cfg = get_country_config(ck)
+            lines_p.append(f"{cfg.get('label', ck)}: `${prices.get(ck, 0.175):.3f}` (Cost: ${base_costs.get(ck, 0.100):.3f})")
+        lines_p.append(f"📧 Mail.tm: `${prices.get('MailTM', 0.01):.3f}`")
+        lines_p.append("\nSelect an option or add a new number menu:")
         await update.message.reply_text(
-            f"💵 **Current Prices:**\n"
-            f"🇺🇸 USA: `${prices.get('USA', 0.175):.3f}` (Cost: ${base_costs['USA']:.3f})\n"
-            f"🇨🇳 China: `${prices.get('China', 0.195):.3f}` (Cost: ${base_costs['China']:.3f})\n"
-            f"📧 Mail.tm: `${prices.get('MailTM', 0.01):.3f}`\n\n"
-            f"Select an option:",
+            "\n".join(lines_p),
             parse_mode="Markdown",
             reply_markup=get_price_country_keyboard()
         )
         return
 
-    if text in ["🇺🇸 Set USA Price", "🇨🇳 Set China Price", "📧 Set Mail.tm Price"]:
-        if "USA" in text:
-            c_key = "USA"
-        elif "China" in text:
-            c_key = "China"
-        else:
-            c_key = "MailTM"
-        admin_states[user_id] = f"WAITING_PRICE_{c_key}"
-        await update.message.reply_text(f"✍️ Enter new **Sell Price** for **{c_key}**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+    if text == "➕ افزودن منوی شماره جدید":
+        pending_new_country[user_id] = {}
+        admin_states[user_id] = "NEW_COUNTRY_NAME"
+        await update.message.reply_text(
+            "🆕 **افزودن منوی شماره جدید**\n\nنام منو/کشور را وارد کنید (مثلاً: `امارات` یا `UK` یا `ترکیه`):",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
         return
 
+    if state == "NEW_COUNTRY_NAME":
+        title_clean = text.strip()
+        if not title_clean:
+            await update.message.reply_text("❌ نام نمی‌تواند خالی باشد.")
+            return
+        safe_key = re.sub(r'[^A-Za-z0-9_]', '_', title_clean)
+        if not safe_key or safe_key in get_all_country_keys():
+            safe_key = f"Custom_{int(time.time()) % 10000}"
+        label = title_clean if any(ord(ch) > 127 for ch in title_clean) else f"🌍 {title_clean}"
+        pending_new_country[user_id] = {
+            "key": safe_key,
+            "label": label,
+            "btn_text": f"{label} شماره",
+            "upload_label": f"{label} (آپلود)"
+        }
+        admin_states[user_id] = "NEW_COUNTRY_PRICE"
+        await update.message.reply_text(
+            f"💵 قیمت فروش شماره برای **{label}** را به دلار وارد کنید (مثلاً `0.18`):",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    if state == "NEW_COUNTRY_PRICE":
+        try:
+            p_val = float(text.strip())
+            if p_val < 0:
+                raise ValueError
+            pending_new_country[user_id]["price"] = round(p_val, 4)
+            admin_states[user_id] = "NEW_COUNTRY_OTP_DIGITS"
+            await update.message.reply_text(
+                "🔢 کد تایید (OTP) برای این منو چند رقمی است؟ (معمولاً `5` یا `6` — یک عدد وارد کنید):",
+                parse_mode="Markdown",
+                reply_markup=get_cancel_admin_keyboard()
+            )
+        except ValueError:
+            await update.message.reply_text("❌ لطفاً قیمت معتبر وارد کنید.")
+        return
+
+    if state == "NEW_COUNTRY_OTP_DIGITS":
+        try:
+            digits = int(text.strip())
+            if digits < 3 or digits > 10:
+                raise ValueError
+            pending_new_country[user_id]["otp_digits"] = digits
+            admin_states[user_id] = "NEW_COUNTRY_PREFIX_MODE"
+            await update.message.reply_text(
+                "✂️ آیا شماره‌های این منو پیش‌شماره داشته باشند و هنگام آپلود حذف شود یا خیر؟",
+                parse_mode="Markdown",
+                reply_markup=get_prefix_choice_keyboard()
+            )
+        except ValueError:
+            await update.message.reply_text("❌ لطفاً تعداد ارقام معتبر (مثلاً `5` یا `6`) وارد کنید.")
+        return
+
+    if state == "NEW_COUNTRY_PREFIX_MODE":
+        if text == "✂️ حذف پیش‌شماره":
+            pending_new_country[user_id]["strip_prefix"] = True
+            admin_states[user_id] = "NEW_COUNTRY_PREFIX_VAL"
+            await update.message.reply_text(
+                "🔢 پیش‌شماره‌ای که باید از ابتدای شماره حذف شود را وارد کنید (مثلاً `1` یا `971` یا `44`):",
+                parse_mode="Markdown",
+                reply_markup=get_cancel_admin_keyboard()
+            )
+        elif text == "📌 بدون حذف پیش‌شماره":
+            cfg_draft = pending_new_country.pop(user_id, {})
+            c_key = cfg_draft["key"]
+            new_cfg = {
+                "label": cfg_draft["label"],
+                "btn_text": cfg_draft["btn_text"],
+                "upload_label": cfg_draft["upload_label"],
+                "price": cfg_draft["price"],
+                "otp_digits": cfg_draft["otp_digits"],
+                "strip_prefix": False,
+                "prefix": ""
+            }
+            config_db["custom_countries"][c_key] = new_cfg
+            config_db["prices"][c_key] = new_cfg["price"]
+            config_db.setdefault("base_costs", {}).setdefault(c_key, round(new_cfg["price"] * 0.6, 4))
+            if c_key not in data:
+                data[c_key] = []
+            get_daily_stats()
+            await save_all_dbs_async()
+            admin_states.pop(user_id, None)
+            await update.message.reply_text(
+                f"✅ منوی جدید **{new_cfg['label']}** ساخته شد و به بخش خرید شماره و **Add Numbers** اضافه گردید.\n"
+                f"▫️ قیمت: `${new_cfg['price']:.3f}` | کد: `{new_cfg['otp_digits']}` رقمی | حذف پیش‌شماره: خیر",
+                parse_mode="Markdown",
+                reply_markup=get_admin_keyboard()
+            )
+        return
+
+    if state == "NEW_COUNTRY_PREFIX_VAL":
+        prefix_clean = re.sub(r'\D', '', text.strip())
+        cfg_draft = pending_new_country.pop(user_id, {})
+        c_key = cfg_draft["key"]
+        new_cfg = {
+            "label": cfg_draft["label"],
+            "btn_text": cfg_draft["btn_text"],
+            "upload_label": cfg_draft["upload_label"],
+            "price": cfg_draft["price"],
+            "otp_digits": cfg_draft["otp_digits"],
+            "strip_prefix": bool(prefix_clean),
+            "prefix": prefix_clean
+        }
+        config_db["custom_countries"][c_key] = new_cfg
+        config_db["prices"][c_key] = new_cfg["price"]
+        config_db.setdefault("base_costs", {}).setdefault(c_key, round(new_cfg["price"] * 0.6, 4))
+        if c_key not in data:
+            data[c_key] = []
+        get_daily_stats()
+        await save_all_dbs_async()
+        admin_states.pop(user_id, None)
+        await update.message.reply_text(
+            f"✅ منوی جدید **{new_cfg['label']}** ساخته شد و به بخش خرید شماره و **Add Numbers** اضافه گردید.\n"
+            f"▫️ قیمت: `${new_cfg['price']:.3f}` | کد: `{new_cfg['otp_digits']}` رقمی | پیش‌شماره حذفی: `{prefix_clean or 'ندارد'}`",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+
+    if text.startswith("📧 Mail.tm"):
+        admin_states[user_id] = "WAITING_PRICE_MailTM"
+        await update.message.reply_text("✍️ Enter new **Sell Price** for **MailTM**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+        return
+
+    for _ck in get_all_country_keys():
+        _cfg = get_country_config(_ck)
+        if text.startswith(f"💵 {_cfg.get('label', _ck)}"):
+            admin_states[user_id] = f"WAITING_PRICE_{_ck}"
+            await update.message.reply_text(f"✍️ Enter new **Sell Price** for **{_cfg.get('label', _ck)}**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+            return
+
     if state and state.startswith("WAITING_PRICE_"):
-        c_key = state.split("_")[-1]
+        c_key = state.replace("WAITING_PRICE_", "", 1)
         try:
             new_price = float(text)
             if new_price < 0:
@@ -982,6 +1241,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "prices" not in config_db:
                 config_db["prices"] = {}
             config_db["prices"][c_key] = round(new_price, 4)
+            if c_key in config_db.get("custom_countries", {}):
+                config_db["custom_countries"][c_key]["price"] = round(new_price, 4)
             await save_db_async("config", config_db)
             await update.message.reply_text(f"✅ **{c_key}** Price updated to `${new_price:.3f}`.", parse_mode="Markdown", reply_markup=get_admin_keyboard())
             admin_states.pop(user_id, None)
@@ -991,24 +1252,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     if text == "💲 Set Base Costs":
         admin_states[user_id] = "WAITING_BASE_COST_COUNTRY"
-        await update.message.reply_text("💲 Enter country to set base cost (`USA` or `China`):", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+        await update.message.reply_text("💲 Enter country to set base cost (`USA`, `China`, `Canada` or custom key):", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
 
     if state == "WAITING_BASE_COST_COUNTRY":
-        c_key = text.strip().capitalize()
-        if c_key not in ["Usa", "China"]:
+        raw_c = text.strip()
+        c_key = None
+        for ck in get_all_country_keys():
+            if ck.lower() == raw_c.lower() or get_country_config(ck).get("label") == raw_c:
+                c_key = ck
+                break
+        if not c_key:
             await update.message.reply_text("❌ Invalid country.")
             return
-        c_key = "USA" if c_key == "Usa" else "China"
         admin_states[user_id] = f"WAITING_BASE_COST_AMT_{c_key}"
         await update.message.reply_text(f"✍️ Enter new **Base Cost** for **{c_key}**:", parse_mode="Markdown")
         return
 
     if state and state.startswith("WAITING_BASE_COST_AMT_"):
-        c_key = state.split("_")[-1]
+        c_key = state.replace("WAITING_BASE_COST_AMT_", "", 1)
         try:
             new_cost = float(text)
-            config_db["base_costs"][c_key] = round(new_cost, 4)
+            config_db.setdefault("base_costs", {})[c_key] = round(new_cost, 4)
             await save_db_async("config", config_db)
             await update.message.reply_text(f"✅ **{c_key}** Base Cost updated to `${new_cost:.3f}`.", parse_mode="Markdown", reply_markup=get_admin_keyboard())
             admin_states.pop(user_id, None)
@@ -1020,20 +1285,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_users = len(users_db)
         total_bal = sum(u.get("balance", 0.0) for u in users_db.values())
         
-        usa_all = data.get("USA", [])
-        china_all = data.get("China", [])
-        
-        usa_free = len([n for n in usa_all if n.get("status") == "free"])
-        usa_otp = len([n for n in usa_all if n.get("status") == "used" and n.get("has_code")])
-        
-        ch_free = len([n for n in china_all if n.get("status") == "free"])
-        ch_otp = len([n for n in china_all if n.get("status") == "used" and n.get("has_code")])
+        base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
+        total_cost = 0.0
+        inv_lines = []
+        for ck in get_all_country_keys():
+            c_all = data.get(ck, [])
+            c_free = len([n for n in c_all if n.get("status") == "free"])
+            c_otp = len([n for n in c_all if n.get("status") == "used" and n.get("has_code")])
+            total_cost += c_otp * base_costs.get(ck, 0.100)
+            cfg = get_country_config(ck)
+            inv_lines.append(f"{cfg.get('label', ck)} Inventory:\n   ├ 🆓 Free: `{c_free}`\n   └ ✅ OTP Received: `{c_otp}`")
 
         total_deposits = config_db.get("total_deposits", 0.0)
         total_spent = sum(u.get("total_spent", 0.0) for u in users_db.values())
-        
-        base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120})
-        total_cost = (usa_otp * base_costs["USA"]) + (ch_otp * base_costs["China"])
         net_profit = total_spent - total_cost
 
         stats_msg = (
@@ -1041,13 +1305,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━\n"
             f"👥 **Total Users:** `{total_users}`\n"
             f"💵 **Users Balance:** `${total_bal:.3f} USD`\n\n"
-            f"🇺🇸 **USA Inventory:**\n"
-            f"   ├ 🆓 Free: `{usa_free}`\n"
-            f"   └ ✅ OTP Received: `{usa_otp}`\n\n"
-            f"🇨🇳 **China Inventory:**\n"
-            f"   ├ 🆓 Free: `{ch_free}`\n"
-            f"   └ ✅ OTP Received: `{ch_otp}`\n\n"
-            f"💰 **Financials:**\n"
+            + "\n\n".join(inv_lines) +
+            f"\n\n💰 **Financials:**\n"
             f"   ├ Total Deposits: `${total_deposits:.3f}`\n"
             f"   ├ Total Sales: `${total_spent:.3f}`\n"
             f"   └ **Net Profit:** `${net_profit:.3f} USD`"
@@ -1084,7 +1343,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == "DELETE_MENU":
         if text == "♻️ Delete Used (OTP Received)":
-            for country in ["USA", "China"]:
+            for country in get_all_country_keys():
                 new_list = []
                 for n in data.get(country, []):
                     if n.get("status") == "used":
@@ -1103,8 +1362,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             admin_states.pop(user_id, None)
             
         elif text == "🗑 Delete All Numbers":
-            data["USA"] = []
-            data["China"] = []
+            for ck in get_all_country_keys():
+                data[ck] = []
             await save_db_async("data", data)
             await update.message.reply_text("✅ All numbers cleared.", reply_markup=get_admin_keyboard())
             admin_states.pop(user_id, None)
@@ -1131,13 +1390,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🌐 All Users":
             export_lines = []
             if state == "EXPORT_OTP":
-                for country in ["USA", "China"]:
+                for country in get_all_country_keys():
                     for item in data.get(country, []):
                         if item.get("status") == "used" and item.get("has_code", False):
                             export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
                 await send_export_file(update, export_lines, "otp_received.txt")
             elif state == "EXPORT_NOCODE":
-                for country in ["USA", "China"]:
+                for country in get_all_country_keys():
                     for item in data.get(country, []):
                         if item.get("status") == "used" and not item.get("has_code", False):
                             export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
@@ -1157,13 +1416,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_id = int(text)
             export_lines = []
             if "EXPORT_OTP" in state:
-                for country in ["USA", "China"]:
+                for country in get_all_country_keys():
                     for item in data.get(country, []):
                         if item.get("status") == "used" and item.get("has_code", False) and item.get("user_id") == target_id:
                             export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
                 fname = f"user_{target_id}_otp_received.txt"
             elif "EXPORT_NOCODE" in state:
-                for country in ["USA", "China"]:
+                for country in get_all_country_keys():
                     for item in data.get(country, []):
                         if item.get("status") == "used" and not item.get("has_code", False) and item.get("user_id") == target_id:
                             export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
@@ -1226,32 +1485,42 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 zip_ref.extractall(".")
             os.remove(zip_path)
             global data, users_db, config_db, mail_tokens_db
-            data = load_db("data", {"USA": [], "China": [], "used_names": [], "canceled": []})
+            data = load_db("data", {"USA": [], "China": [], "Canada": [], "used_names": [], "canceled": []})
+            for _ck in ["USA", "China", "Canada"]:
+                if _ck not in data:
+                    data[_ck] = []
             if "canceled" not in data:
                 data["canceled"] = []
             users_db = load_db("users", {})
             config_db = load_db("config", {
                 "active": True,
-                "prices": {"USA": 0.175, "China": 0.195, "MailTM": 0.01},
-                "base_costs": {"USA": 0.100, "China": 0.120},
+                "prices": {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01},
+                "base_costs": {"USA": 0.100, "China": 0.120, "Canada": 0.100},
                 "usdt_bep20_address": "0xYourDefaultUSDT_BEP20_Wallet_Address_Here",
-                "total_deposits": 0.0
+                "total_deposits": 0.0,
+                "country_settings": json.loads(json.dumps(DEFAULT_COUNTRY_SETTINGS)),
+                "custom_countries": {}
             })
-            config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
+            config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+            config_db["prices"].setdefault("USA", 0.175)
+            config_db["prices"].setdefault("China", 0.195)
+            config_db["prices"].setdefault("Canada", 0.175)
             config_db["prices"].setdefault("MailTM", 0.01)
-            config_db.setdefault("base_costs", {"USA": 0.100, "China": 0.120})
+            config_db.setdefault("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
             config_db.setdefault("usdt_bep20_address", "0xYourDefaultUSDT_BEP20_Wallet_Address_Here")
             config_db.setdefault("total_deposits", 0.0)
+            config_db.setdefault("custom_countries", {})
+            config_db.setdefault("country_settings", json.loads(json.dumps(DEFAULT_COUNTRY_SETTINGS)))
             mail_tokens_db = load_db("mail_tokens", {})
             await save_all_dbs_async()
             prices = config_db["prices"]
             wallet = config_db["usdt_bep20_address"]
+            stock_summary = " | ".join([f"{ck}: `{len([n for n in data.get(ck, []) if n.get('status') == 'free'])}`" for ck in get_all_country_keys()])
             await status_msg.edit_text(
                 f"✅ **Full Database Restored!**\n\n"
                 f"👥 Users: `{len(users_db)}`\n"
-                f"🇺🇸 USA Stock: `{len([n for n in data.get('USA', []) if n.get('status') == 'free'])}`\n"
-                f"🇨🇳 China Stock: `{len([n for n in data.get('China', []) if n.get('status') == 'free'])}`\n"
-                f"💵 Prices: USA `${prices.get('USA', 0.175):.3f}` | China `${prices.get('China', 0.195):.3f}` | Mail.tm `${prices.get('MailTM', 0.01):.3f}`\n"
+                f"📦 Stock: {stock_summary}\n"
+                f"💵 Prices: USA `${prices.get('USA', 0.175):.3f}` | China `${prices.get('China', 0.195):.3f}` | Canada `${prices.get('Canada', 0.175):.3f}` | Mail.tm `${prices.get('MailTM', 0.01):.3f}`\n"
                 f"🏦 Wallet: `{wallet}`",
                 parse_mode="Markdown"
             )
@@ -1259,13 +1528,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(f"❌ Restore error: {e}")
         return
 
-    if state in ["WAITING_FILE_CHINA", "WAITING_FILE_USA"]:
+    if state and state.startswith("WAITING_FILE_"):
         if not doc_name or not doc_name.lower().endswith('.txt'):
             await update.message.reply_text("❌ Please upload a valid `.txt` file!")
             return
 
         status_msg = await update.message.reply_text("⏳ Processing...")
-        country = "China" if "CHINA" in state else "USA"
+        country = state.replace("WAITING_FILE_", "", 1)
+        data.setdefault(country, [])
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
         batch_id = f"{country}_{timestamp_str}"
         
@@ -1278,7 +1548,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = f.read().splitlines()
         
         for line in lines:
-            link, phone = process_data_line(line)
+            link, phone = process_data_line(line, country)
             if link and phone:
                 unique_name = await get_unique_name(country)
                 data[country].append({
@@ -1471,7 +1741,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     if action == "my_orders":
         orders = []
-        for country in ["USA", "China"]:
+        for country in get_all_country_keys():
             for item in data.get(country, []):
                 if item.get("user_id") == user_id:
                     status_icon = "✅" if item.get("has_code") else "⏳"
@@ -1487,7 +1757,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action.startswith("buy_country_") or action.startswith("buy_another_"):
         is_buy_another = action.startswith("buy_another_")
         country = action.replace("buy_another_", "") if is_buy_another else action.replace("buy_country_", "")
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "MailTM": 0.01})
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
         price = prices.get(country, 0.175)
         
         if u_rec.get("balance", 0.0) < price:
@@ -1515,7 +1785,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_db_async("config", config_db)
         await save_db_async("data", data)
 
-        flag = "🇺🇸" if country == "USA" else "🇨🇳"
+        flag = get_country_config(country).get("label", country)
         
         num_msg = (
             f"📱 **NUMBER ASSIGNED**\n\n"
@@ -1607,7 +1877,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     response = await client.get(link, timeout=10.0)
                     
             text_response = str(response.text)
-            sms_codes = re.findall(r'\b\d{6}\b', text_response) if country == "China" else re.findall(r'\b\d{5}\b', text_response)
+            otp_digits = int(get_country_config(country).get("otp_digits", 6 if country == "China" else 5))
+            sms_codes = re.findall(rf'\b\d{{{otp_digits}}}\b', text_response)
             sms_code = sms_codes[-1] if sms_codes else None
             
             if sms_code:
@@ -1620,7 +1891,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await save_db_async("data", data)
                     await save_db_async("users", users_db)
                 
-                flag = "🇺🇸" if country == "USA" else "🇨🇳"
+                flag = get_country_config(country).get("label", country)
                 identity_name = item.get("identity") or await get_unique_name(country)
                 
                 otp_msg = (
@@ -1640,8 +1911,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(text=otp_msg, parse_mode="Markdown", reply_markup=markup)
                 await query.answer("✅ OTP Received!")
             else:
-                code_len_str = "6-digit" if country == "China" else "5-digit"
-                await query.answer(f"⏳ No {code_len_str} OTP yet. Please wait and try again.", show_alert=True)
+                otp_digits = int(get_country_config(country).get("otp_digits", 6 if country == "China" else 5))
+                await query.answer(f"⏳ No {otp_digits}-digit OTP yet. Please wait and try again.", show_alert=True)
         except Exception as e:
             await query.answer(f"❌ API Error.", show_alert=True)
         return
