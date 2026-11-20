@@ -118,25 +118,25 @@ async def save_db_async(name, data_obj):
 
 DEFAULT_COUNTRY_SETTINGS = {
     "USA": {
-        "label": "🇺🇸 آمریکا",
+        "label": "🇺🇸 USA",
         "btn_text": "🇺🇸 USA +1 Telegram",
-        "upload_label": "🇺🇸 آمریکا (آپلود)",
+        "upload_label": "🇺🇸 USA (Upload)",
         "otp_digits": 5,
         "strip_prefix": True,
         "prefix": "1"
     },
     "China": {
-        "label": "🇨🇳 چین",
+        "label": "🇨🇳 China",
         "btn_text": "🇨🇳 China +86 Telegram",
-        "upload_label": "🇨🇳 چین (آپلود)",
+        "upload_label": "🇨🇳 China (Upload)",
         "otp_digits": 6,
         "strip_prefix": True,
         "prefix": "86"
     },
     "Canada": {
-        "label": "🇨🇦 کانادا",
-        "btn_text": "🇨🇦 کانادا (+1)",
-        "upload_label": "🇨🇦 کانادا (آپلود)",
+        "label": "🇨🇦 Canada",
+        "btn_text": "🇨🇦 Canada (+1)",
+        "upload_label": "🇨🇦 Canada (Upload)",
         "otp_digits": 5,
         "strip_prefix": True,
         "prefix": "1"
@@ -191,8 +191,8 @@ for _ck, _ccfg in config_db["custom_countries"].items():
     config_db["prices"].setdefault(_ck, _ccfg.get("price", 0.175))
     config_db["base_costs"].setdefault(_ck, _ccfg.get("base_cost", 0.100))
     _ccfg.setdefault("label", f"🌍 {_ck}")
-    _ccfg.setdefault("btn_text", f"{_ccfg['label']} شماره")
-    _ccfg.setdefault("upload_label", f"{_ccfg['label']} (آپلود)")
+    _ccfg.setdefault("btn_text", f"{_ccfg['label']} Number")
+    _ccfg.setdefault("upload_label", f"{_ccfg['label']} (Upload)")
     _ccfg.setdefault("otp_digits", 5)
     _ccfg.setdefault("strip_prefix", False)
     _ccfg.setdefault("prefix", "")
@@ -217,7 +217,7 @@ def get_country_config(country_key):
     return {
         "label": country_key,
         "btn_text": f"🌍 {country_key}",
-        "upload_label": f"{country_key} (آپلود)",
+        "upload_label": f"{country_key} (Upload)",
         "otp_digits": 5,
         "strip_prefix": False,
         "prefix": ""
@@ -618,7 +618,7 @@ def get_country_upload_keyboard():
     row = []
     for c_key in get_all_country_keys():
         cfg = get_country_config(c_key)
-        row.append(cfg.get("upload_label", f"{c_key} (آپلود)"))
+        row.append(cfg.get("upload_label", f"{c_key} (Upload)"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -640,13 +640,13 @@ def get_price_country_keyboard():
             row = []
     if row:
         rows.append(row)
-    rows.append([f"📧 Mail.tm (${prices.get('MailTM', 0.01):.3f})", "➕ افزودن منوی شماره جدید"])
+    rows.append([f"📧 Mail.tm (${prices.get('MailTM', 0.01):.3f})", "➕ Add Number Menu"])
     rows.append(["💲 Set Base Costs", "🔙 Back to Admin"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def get_prefix_choice_keyboard():
     return ReplyKeyboardMarkup([
-        ["✂️ حذف پیش‌شماره", "📌 بدون حذف پیش‌شماره"],
+        ["✂️ Strip Prefix", "📌 Keep Prefix"],
         ["🔙 Back to Admin"]
     ], resize_keyboard=True)
 
@@ -1089,11 +1089,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text == "➕ افزودن منوی شماره جدید":
+    if text == "➕ Add Number Menu":
         pending_new_country[user_id] = {}
         admin_states[user_id] = "NEW_COUNTRY_NAME"
         await update.message.reply_text(
-            "🆕 **افزودن منوی شماره جدید**\n\nنام منو/کشور را وارد کنید (مثلاً: `امارات` یا `UK` یا `ترکیه`):",
+            "🆕 **Add New Number Menu**\n\nEnter the menu/country name (e.g., `UAE`, `UK`, or `Turkey`):",
             parse_mode="Markdown",
             reply_markup=get_cancel_admin_keyboard()
         )
@@ -1102,7 +1102,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "NEW_COUNTRY_NAME":
         title_clean = text.strip()
         if not title_clean:
-            await update.message.reply_text("❌ نام نمی‌تواند خالی باشد.")
+            await update.message.reply_text("❌ Name cannot be empty.")
             return
         safe_key = re.sub(r'[^A-Za-z0-9_]', '_', title_clean)
         if not safe_key or safe_key in get_all_country_keys():
@@ -1111,12 +1111,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_new_country[user_id] = {
             "key": safe_key,
             "label": label,
-            "btn_text": f"{label} شماره",
-            "upload_label": f"{label} (آپلود)"
+            "btn_text": f"{label} Number",
+            "upload_label": f"{label} (Upload)"
         }
         admin_states[user_id] = "NEW_COUNTRY_PRICE"
         await update.message.reply_text(
-            f"💵 قیمت فروش شماره برای **{label}** را به دلار وارد کنید (مثلاً `0.18`):",
+            f"💵 Enter the **Sell Price** in USD for **{label}** (e.g., `0.18`):",
             parse_mode="Markdown",
             reply_markup=get_cancel_admin_keyboard()
         )
@@ -1130,12 +1130,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_new_country[user_id]["price"] = round(p_val, 4)
             admin_states[user_id] = "NEW_COUNTRY_OTP_DIGITS"
             await update.message.reply_text(
-                "🔢 کد تایید (OTP) برای این منو چند رقمی است؟ (معمولاً `5` یا `6` — یک عدد وارد کنید):",
+                "🔢 How many digits is the **OTP code** for this menu? (Usually `5` or `6` — enter a number):",
                 parse_mode="Markdown",
                 reply_markup=get_cancel_admin_keyboard()
             )
         except ValueError:
-            await update.message.reply_text("❌ لطفاً قیمت معتبر وارد کنید.")
+            await update.message.reply_text("❌ Please enter a valid price.")
         return
 
     if state == "NEW_COUNTRY_OTP_DIGITS":
@@ -1146,24 +1146,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_new_country[user_id]["otp_digits"] = digits
             admin_states[user_id] = "NEW_COUNTRY_PREFIX_MODE"
             await update.message.reply_text(
-                "✂️ آیا شماره‌های این منو پیش‌شماره داشته باشند و هنگام آپلود حذف شود یا خیر؟",
+                "✂️ Should numbers in this menu strip a prefix when uploaded?",
                 parse_mode="Markdown",
                 reply_markup=get_prefix_choice_keyboard()
             )
         except ValueError:
-            await update.message.reply_text("❌ لطفاً تعداد ارقام معتبر (مثلاً `5` یا `6`) وارد کنید.")
+            await update.message.reply_text("❌ Please enter a valid digit count (e.g., `5` or `6`).")
         return
 
     if state == "NEW_COUNTRY_PREFIX_MODE":
-        if text == "✂️ حذف پیش‌شماره":
+        if text == "✂️ Strip Prefix":
             pending_new_country[user_id]["strip_prefix"] = True
             admin_states[user_id] = "NEW_COUNTRY_PREFIX_VAL"
             await update.message.reply_text(
-                "🔢 پیش‌شماره‌ای که باید از ابتدای شماره حذف شود را وارد کنید (مثلاً `1` یا `971` یا `44`):",
+                "🔢 Enter the prefix to strip from the beginning of numbers (e.g., `1`, `971`, or `44`):",
                 parse_mode="Markdown",
                 reply_markup=get_cancel_admin_keyboard()
             )
-        elif text == "📌 بدون حذف پیش‌شماره":
+        elif text == "📌 Keep Prefix":
             cfg_draft = pending_new_country.pop(user_id, {})
             c_key = cfg_draft["key"]
             new_cfg = {
@@ -1184,8 +1184,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await save_all_dbs_async()
             admin_states.pop(user_id, None)
             await update.message.reply_text(
-                f"✅ منوی جدید **{new_cfg['label']}** ساخته شد و به بخش خرید شماره و **Add Numbers** اضافه گردید.\n"
-                f"▫️ قیمت: `${new_cfg['price']:.3f}` | کد: `{new_cfg['otp_digits']}` رقمی | حذف پیش‌شماره: خیر",
+                f"✅ New menu **{new_cfg['label']}** created and added to **Buy Number** and **Add Numbers**.\n"
+                f"▫️ Price: `${new_cfg['price']:.3f}` | OTP: `{new_cfg['otp_digits']}` digits | Strip Prefix: No",
                 parse_mode="Markdown",
                 reply_markup=get_admin_keyboard()
             )
@@ -1213,8 +1213,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_all_dbs_async()
         admin_states.pop(user_id, None)
         await update.message.reply_text(
-            f"✅ منوی جدید **{new_cfg['label']}** ساخته شد و به بخش خرید شماره و **Add Numbers** اضافه گردید.\n"
-            f"▫️ قیمت: `${new_cfg['price']:.3f}` | کد: `{new_cfg['otp_digits']}` رقمی | پیش‌شماره حذفی: `{prefix_clean or 'ندارد'}`",
+            f"✅ New menu **{new_cfg['label']}** created and added to **Buy Number** and **Add Numbers**.\n"
+            f"▫️ Price: `${new_cfg['price']:.3f}` | OTP: `{new_cfg['otp_digits']}` digits | Stripped Prefix: `{prefix_clean or 'None'}`",
             parse_mode="Markdown",
             reply_markup=get_admin_keyboard()
         )
