@@ -20,6 +20,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
     MessageHandler, filters, ContextTypes, ApplicationBuilder
 )
+from telegram.request import HTTPXRequest
 from faker import Faker
 
 # ==========================================
@@ -31,11 +32,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logging.error(f"⚠️ Unexpected Bot Error: {context.error}", exc_info=context.error)
 
 # ==========================================
-# Mail.tm Configuration & Pool
+# Email Servers Configuration (Venus 1 & 2 + Mail.tm)
 # ==========================================
+DEFAULT_VENUS_API_KEY = "7587257111:KxJDbyeLJqhnGSTEdKhV"
+DEFAULT_VENUS_BASE_URL = "https://venusads.ir/api/V1/email/"
 MAIL_TM_BASE = "https://api.mail.tm"
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 mail_tm_pool = []
 used_mail_addresses = set()
+email_retry_counts = {}
 
 # ==========================================
 # Web Server to keep the bot alive on Render
@@ -173,12 +178,24 @@ data["used_names"] = list(used_names_set)
 data["used_numbers"] = list(used_numbers_set)
 
 users_db = load_db("users", {})
+history_db = load_db("history", [])
+if not isinstance(history_db, list):
+    history_db = []
+proxies_db = load_db("proxies", {"proxies": []})
+if "proxies" not in proxies_db or not isinstance(proxies_db["proxies"], list):
+    proxies_db["proxies"] = []
+
 config_db = load_db("config", {
     "active": True,
-    "prices": {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01},
+    "prices": {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05},
     "base_costs": {"USA": 0.100, "China": 0.120, "Canada": 0.100},
     "usdt_bep20_address": "0xYourDefaultUSDT_BEP20_Wallet_Address_Here",
     "total_deposits": 0.0,
+    "email_server": "mail_tm",
+    "email_token": DEFAULT_VENUS_API_KEY,
+    "email_api_url": DEFAULT_VENUS_BASE_URL,
+    "proxy_token": "",
+    "proxy_api_url": "",
     "country_settings": json.loads(json.dumps(DEFAULT_COUNTRY_SETTINGS)),
     "custom_countries": {}
 })
@@ -187,11 +204,17 @@ for _mt_val in mail_tokens_db.values():
     if isinstance(_mt_val, dict) and _mt_val.get("email"):
         used_mail_addresses.add(_mt_val["email"])
 
-config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
 config_db["prices"].setdefault("USA", 0.175)
 config_db["prices"].setdefault("China", 0.195)
 config_db["prices"].setdefault("Canada", 0.175)
 config_db["prices"].setdefault("MailTM", 0.01)
+config_db["prices"].setdefault("Proxy", 0.05)
+config_db.setdefault("email_server", "mail_tm")
+config_db.setdefault("email_token", DEFAULT_VENUS_API_KEY)
+config_db.setdefault("email_api_url", DEFAULT_VENUS_BASE_URL)
+config_db.setdefault("proxy_token", "")
+config_db.setdefault("proxy_api_url", "")
 
 config_db.setdefault("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
 config_db["base_costs"].setdefault("USA", 0.100)
@@ -339,6 +362,8 @@ def save_all_dbs():
     save_db("users", users_db)
     save_db("config", config_db)
     save_db("mail_tokens", mail_tokens_db)
+    save_db("proxies", proxies_db)
+    save_db("history", history_db)
 
 async def save_all_dbs_async():
     await asyncio.to_thread(save_all_dbs)
@@ -418,12 +443,70 @@ def get_user_record(user_id):
             "ref_earnings": 0.0,
             "referred_by": None,
             "deposit_history": [],
-            "canceled_count": 0
+            "canceled_count": 0,
+            "last_proxy_idx": -1
         }
         save_db("users", users_db)
     if "canceled_count" not in users_db[u_str]:
         users_db[u_str]["canceled_count"] = 0
+    if "last_proxy_idx" not in users_db[u_str]:
+        users_db[u_str]["last_proxy_idx"] = -1
+    if "total_used_numbers" not in users_db[u_str]:
+        users_db[u_str]["total_used_numbers"] = 0
+    if "total_used_emails" not in users_db[u_str]:
+        users_db[u_str]["total_used_emails"] = 0
+    if "total_used_proxies" not in users_db[u_str]:
+        users_db[u_str]["total_used_proxies"] = 0
     return users_db[u_str]
+
+def get_today_iran_str():
+    return datetime.now(IRAN_TZ).strftime('%Y-%m-%d')
+
+def get_today_usage(user_id, item_type):
+    today_str = get_today_iran_str()
+    count = 0
+    for h in history_db:
+        rec_date = h.get("date")
+        if not rec_date:
+            rec_date = datetime.fromtimestamp(h.get("ts", 0), IRAN_TZ).strftime('%Y-%m-%d')
+        if str(h.get("user_id")) == str(user_id) and h.get("type") == item_type and rec_date == today_str:
+            count += 1
+    return count
+
+def get_total_today_usage_by_type(item_type):
+    today_str = get_today_iran_str()
+    count = 0
+    for h in history_db:
+        rec_date = h.get("date")
+        if not rec_date:
+            rec_date = datetime.fromtimestamp(h.get("ts", 0), IRAN_TZ).strftime('%Y-%m-%d')
+        if h.get("type") == item_type and rec_date == today_str:
+            count += 1
+    return count
+
+async def log_usage_action(user_id, item_type):
+    global history_db
+    u_rec = get_user_record(user_id)
+    if item_type == "number":
+        u_rec["total_used_numbers"] = u_rec.get("total_used_numbers", 0) + 1
+    elif item_type == "email":
+        u_rec["total_used_emails"] = u_rec.get("total_used_emails", 0) + 1
+    elif item_type == "proxy":
+        u_rec["total_used_proxies"] = u_rec.get("total_used_proxies", 0) + 1
+    await save_db_async("users", users_db)
+
+    today_str = get_today_iran_str()
+    history_db.append({
+        "user_id": int(user_id),
+        "type": item_type,
+        "ts": time.time(),
+        "date": today_str
+    })
+    history_db = [
+        h for h in history_db
+        if h.get("date", datetime.fromtimestamp(h.get("ts", 0), IRAN_TZ).strftime('%Y-%m-%d')) == today_str
+    ]
+    await save_db_async("history", history_db)
 
 # ==========================================
 # Nightly Report — Only 24h cycle counts (resets at 12:00 AM Iran Time)
@@ -634,9 +717,10 @@ async def auto_refund_worker(application: Application):
 # ==========================================
 def get_main_keyboard(user_id):
     keys = [
-        ["⚡ Buy Number", "📧 Mail.tm Email"],
-        ["💼 Deposit", "🆔 Profile"],
-        ["🎁 Refer & Earn", "👀 Support"]
+        ["⚡ Buy Number", "📧 Buy Email"],
+        ["🌐 Buy Proxy", "💼 Deposit"],
+        ["🎁 Refer & Earn", "👀 Support"],
+        ["🆔 Profile"]
     ]
     if user_id == ADMIN_ID:
         keys.append(["⚙️ Admin Panel"])
@@ -646,10 +730,35 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Add Numbers", "💰 Manage Balance"],
         ["💵 Set Prices", "🏦 Set USDT Wallet"],
-        ["📊 Statistics", "👥 User Report"],
-        ["🗑 Delete", "📥 Export"],
-        ["📢 Broadcast", "⚙️ System Toggle"],
-        ["📁 Send Database", "🔙 User Menu"]
+        ["🌐 Proxy & Email Settings", "📊 Statistics"],
+        ["👥 User Report", "🗑 Delete"],
+        ["📥 Export", "📢 Broadcast"],
+        ["⚙️ System Toggle", "📁 Send Database"],
+        ["🔙 User Menu"]
+    ], resize_keyboard=True)
+
+def get_services_keyboard():
+    return ReplyKeyboardMarkup([
+        ["🌐 Proxy Settings", "📧 Email Settings"],
+        ["🔙 Back to Admin"]
+    ], resize_keyboard=True)
+
+def get_email_admin_keyboard(current_server="mail_tm"):
+    s1 = "✅ Venus Server 1 (Active)" if str(current_server) == "1" else "1️⃣ Venus Server 1"
+    s2 = "✅ Venus Server 2 (Active)" if str(current_server) == "2" else "2️⃣ Venus Server 2"
+    s3 = "✅ Mail.tm Server (Active)" if str(current_server) == "mail_tm" else "🌐 Mail.tm Server"
+    return ReplyKeyboardMarkup([
+        [s1, s2],
+        [s3],
+        ["🔑 Set Venus API Key", "🔗 Set Venus API URL"],
+        ["🔙 Back to Admin"]
+    ], resize_keyboard=True)
+
+def get_proxy_admin_keyboard():
+    return ReplyKeyboardMarkup([
+        ["➕ Add Proxy", "🗑 Delete All Proxies"],
+        ["📋 View Proxies", "🔑 Set Proxy Token"],
+        ["⚡ Set Proxy API URL", "🔙 Back to Admin"]
     ], resize_keyboard=True)
 
 def get_country_upload_keyboard():
@@ -667,7 +776,7 @@ def get_country_upload_keyboard():
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def get_price_country_keyboard():
-    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
     rows = []
     row = []
     for c_key in get_all_country_keys():
@@ -679,9 +788,9 @@ def get_price_country_keyboard():
             row = []
     if row:
         rows.append(row)
-    rows.append([f"📧 Mail.tm (${prices.get('MailTM', 0.01):.3f})", "➕ Add Number Menu"])
-    rows.append(["🗑 Delete Number Menu", "💲 Set Base Costs"])
-    rows.append(["🔙 Back to Admin"])
+    rows.append([f"📧 Email (${prices.get('MailTM', 0.01):.3f})", f"🌐 Proxy (${prices.get('Proxy', 0.05):.3f})"])
+    rows.append(["➕ Add Number Menu", "🗑 Delete Number Menu"])
+    rows.append(["💲 Set Base Costs", "🔙 Back to Admin"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def get_prefix_choice_keyboard():
@@ -817,10 +926,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================================
-    # Mail.tm Email Purchase Flow
+    # Buy Email Flow (Venus Server 1, Venus Server 2 & Mail.tm)
     # ==========================================
-    if text == "📧 Mail.tm Email":
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+    if text in ["📧 Buy Email", "📧 Mail.tm Email"]:
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
         price = prices.get("MailTM", 0.01)
 
         if u_rec.get("balance", 0.0) < price:
@@ -833,27 +942,100 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        email_addr, mail_token = None, None
-        if mail_tm_pool:
-            item = mail_tm_pool.pop(0)
-            email_addr, mail_token = item["address"], item["token"]
-        else:
-            wait_msg = await update.message.reply_text("⏳ Generating fresh Mail.tm address...")
-            email_addr, mail_token = await create_mail_tm_account()
+        email_server = str(config_db.get("email_server", "mail_tm"))
+
+        if email_server == "mail_tm":
+            email_addr, mail_token = None, None
+            if mail_tm_pool:
+                item = mail_tm_pool.pop(0)
+                email_addr, mail_token = item["address"], item["token"]
+            else:
+                wait_msg = await update.message.reply_text("⏳ Generating fresh email address...")
+                email_addr, mail_token = await create_mail_tm_account()
+                try:
+                    await wait_msg.delete()
+                except Exception:
+                    pass
+
+            if email_addr and mail_token:
+                u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
+                u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
+                u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
+                await log_usage_action(user_id, "email")
+
+                req_key = f"mtm_{int(time.time())}_{random.randint(1000, 9999)}"
+                mail_tokens_db[req_key] = {
+                    "token": mail_token,
+                    "email": email_addr,
+                    "user_id": user_id,
+                    "attempts": 0,
+                    "price": price,
+                    "codes": []
+                }
+                await save_db_async("mail_tokens", mail_tokens_db)
+
+                msg = (
+                    f"📧 **Temporary Email Assigned**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✉️ **Email:** `{email_addr}`\n"
+                    f"💵 **Price:** `${price:.3f} USD`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 *Tap the email above to copy, request your verification code, then press* **Get Code** *below (up to 2 codes per email).*"
+                )
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get Code", callback_data=f"mtm_code_{req_key}")]
+                ])
+                await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await update.message.reply_text("❌ Failed to generate an email address right now. No balance was deducted. Please try again.")
+            return
+
+        # Venus Server 1 or Venus Server 2
+        api_key = config_db.get("email_token", DEFAULT_VENUS_API_KEY)
+        base_url = config_db.get("email_api_url", DEFAULT_VENUS_BASE_URL)
+        if not base_url.endswith("/"):
+            base_url += "/"
+
+        url = f"{base_url}getEmail/?key={api_key}&server={email_server}"
+        wait_msg = await update.message.reply_text(f"⏳ Requesting email from Venus Server {email_server}...")
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=12.0)
+                try:
+                    res = response.json()
+                except Exception:
+                    res = response.text
+        except Exception as e:
             try:
                 await wait_msg.delete()
             except Exception:
                 pass
+            await update.message.reply_text(f"❌ Server connection error. No balance was deducted.\n`{e}`", parse_mode="Markdown")
+            return
 
-        if email_addr and mail_token:
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+        email_addr = None
+        req_id = None
+        if isinstance(res, dict):
+            email_addr = res.get("email")
+            req_id = res.get("requestID") or res.get("id") or res.get("request_id")
+
+        if email_addr and req_id:
             u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
             u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
             u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
-            await save_db_async("users", users_db)
+            await log_usage_action(user_id, "email")
 
-            req_key = f"mtm_{int(time.time())}_{random.randint(1000, 9999)}"
-            mail_tokens_db[req_key] = {
-                "token": mail_token,
+            req_id_str = str(req_id)
+            mail_tokens_db[f"venus_{req_id_str}"] = {
+                "provider": "venus",
+                "server": email_server,
+                "request_id": req_id_str,
                 "email": email_addr,
                 "user_id": user_id,
                 "attempts": 0,
@@ -863,19 +1045,65 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await save_db_async("mail_tokens", mail_tokens_db)
 
             msg = (
-                f"📧 **Mail.tm Temporary Email**\n"
+                f"📧 **Temporary Email Assigned (Venus Server {email_server})**\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"✉️ **Email:** `{email_addr}`\n"
                 f"💵 **Price:** `${price:.3f} USD`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💡 *Tap the email above to copy, request your verification code, then press* **Get Code** *below (up to 2 codes per email).*"
+                f"💡 *Tap the email above to copy, request your verification code, then press* **Get Code** *below.*"
             )
             markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Get Code", callback_data=f"mtm_code_{req_key}")]
+                [InlineKeyboardButton("🔄 Get Code", callback_data=f"get_code_venus_{req_id_str}")]
             ])
             await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
         else:
-            await update.message.reply_text("❌ Failed to generate a Mail.tm address right now. No balance was deducted. Please try again.")
+            await update.message.reply_text("❌ No new emails available on this server right now. No balance was deducted.")
+        return
+
+    # ==========================================
+    # Buy Proxy Flow
+    # ==========================================
+    if text == "🌐 Buy Proxy":
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
+        price = prices.get("Proxy", 0.05)
+        proxy_list = proxies_db.get("proxies", [])
+
+        if not proxy_list:
+            await update.message.reply_text(
+                "❌ **Out of Stock!**\n\nNo proxies are currently available. Please check back later.",
+                parse_mode="Markdown"
+            )
+            return
+
+        if u_rec.get("balance", 0.0) < price:
+            await update.message.reply_text(
+                f"❌ **Insufficient Balance!**\n\n"
+                f"💵 **Proxy Price:** `${price:.3f} USD`\n"
+                f"💰 **Your Balance:** `${u_rec.get('balance', 0.0):.3f} USD`\n\n"
+                f"Please top up your account via **💼 Deposit**.",
+                parse_mode="Markdown"
+            )
+            return
+
+        last_idx = u_rec.get("last_proxy_idx", -1)
+        next_idx = (last_idx + 1) % len(proxy_list)
+        selected_proxy = proxy_list[next_idx]
+
+        u_rec["last_proxy_idx"] = next_idx
+        u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
+        u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
+        u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
+        await log_usage_action(user_id, "proxy")
+
+        proxy_msg = (
+            f"🌐 **PROXY PURCHASED SUCCESSFULLY**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 **Price:** `${price:.3f} USD`\n"
+            f"💰 **Remaining Balance:** `${u_rec['balance']:.3f} USD`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 **Your Proxy (Tap to copy):**\n`{selected_proxy}`"
+        )
+        await update.message.reply_text(proxy_msg, parse_mode="Markdown")
         return
 
     # ==========================================
@@ -973,6 +1201,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         refs = u_rec.get("referrals", 0)
         ref_earn = u_rec.get("ref_earnings", 0.0)
         
+        today_nums = get_today_usage(user_id, "number")
+        today_emails = get_today_usage(user_id, "email")
+        today_proxies = get_today_usage(user_id, "proxy")
         profile_msg = (
             f"🎉 **Your Profile**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -981,6 +1212,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 **Balance:** {bal:.3f} USDT\n"
             f"👑 **Total Purchased:** {purchased} items\n"
             f"💵 **Total Spent:** {spent:.3f} USDT\n"
+            f"📅 **Today's Usage (Iran Time):**\n"
+            f"   ├ 📱 Numbers: `{today_nums}`\n"
+            f"   ├ 📧 Emails: `{today_emails}`\n"
+            f"   └ 🌐 Proxies: `{today_proxies}`\n"
             f"📊 **Referrals:** {refs} ({ref_earn:.3f} USDT earned)"
         )
         
@@ -1114,18 +1349,198 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "💵 Set Prices":
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
         base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
         lines_p = ["💵 **Current Prices:**"]
         for ck in get_all_country_keys():
             cfg = get_country_config(ck)
             lines_p.append(f"{cfg.get('label', ck)}: `${prices.get(ck, 0.175):.3f}` (Cost: ${base_costs.get(ck, 0.100):.3f})")
-        lines_p.append(f"📧 Mail.tm: `${prices.get('MailTM', 0.01):.3f}`")
+        lines_p.append(f"📧 Email: `${prices.get('MailTM', 0.01):.3f}`")
+        lines_p.append(f"🌐 Proxy: `${prices.get('Proxy', 0.05):.3f}`")
         lines_p.append("\nSelect an option or add a new number menu:")
         await update.message.reply_text(
             "\n".join(lines_p),
             parse_mode="Markdown",
             reply_markup=get_price_country_keyboard()
+        )
+        return
+
+    # ==========================================
+    # Proxy & Email Settings (Admin)
+    # ==========================================
+    if text == "🌐 Proxy & Email Settings":
+        admin_states.pop(user_id, None)
+        await update.message.reply_text(
+            "⚙️ **Proxy & Email Settings**\n\nSelect the section you want to manage:",
+            parse_mode="Markdown",
+            reply_markup=get_services_keyboard()
+        )
+        return
+
+    if text == "🌐 Proxy Settings":
+        total_p = len(proxies_db.get("proxies", []))
+        p_price = config_db.get("prices", {}).get("Proxy", 0.05)
+        await update.message.reply_text(
+            f"🌐 **Proxy Management**\n\n"
+            f"📦 **Stored Proxies:** `{total_p}`\n"
+            f"💵 **Current Price:** `${p_price:.3f} USD`",
+            parse_mode="Markdown",
+            reply_markup=get_proxy_admin_keyboard()
+        )
+        return
+
+    if text == "➕ Add Proxy":
+        admin_states[user_id] = "WAITING_PROXY"
+        await update.message.reply_text(
+            "🔗 Send the new proxy or list of proxies (one per line):",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    if state == "WAITING_PROXY":
+        new_proxies = [line.strip() for line in text.splitlines() if line.strip()]
+        if not new_proxies:
+            await update.message.reply_text("❌ No valid proxy found. Please try again.")
+            return
+        proxies_db.setdefault("proxies", []).extend(new_proxies)
+        await save_db_async("proxies", proxies_db)
+        admin_states.pop(user_id, None)
+        await update.message.reply_text(
+            f"✅ Added `{len(new_proxies)}` proxy(s). Total stored: `{len(proxies_db['proxies'])}`.",
+            parse_mode="Markdown",
+            reply_markup=get_proxy_admin_keyboard()
+        )
+        return
+
+    if text == "📋 View Proxies":
+        plist = proxies_db.get("proxies", [])
+        if not plist:
+            await update.message.reply_text("❌ No proxies stored in database.", reply_markup=get_proxy_admin_keyboard())
+            return
+        preview = "\n".join([f"{i+1}. `{p}`" for i, p in enumerate(plist[:30])])
+        extra = f"\n... and `{len(plist) - 30}` more." if len(plist) > 30 else ""
+        await update.message.reply_text(
+            f"📋 **Stored Proxies ({len(plist)}):**\n\n{preview}{extra}",
+            parse_mode="Markdown",
+            reply_markup=get_proxy_admin_keyboard()
+        )
+        return
+
+    if text == "?? Delete All Proxies":
+        proxies_db["proxies"] = []
+        await save_db_async("proxies", proxies_db)
+        await update.message.reply_text("✅ All proxies have been deleted.", reply_markup=get_proxy_admin_keyboard())
+        return
+
+    if text == "🔑 Set Proxy Token":
+        admin_states[user_id] = "WAITING_PROXY_TOKEN"
+        await update.message.reply_text(
+            "🔑 Send the new **Proxy Token** text (or upload a `.txt` token file):",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    if state == "WAITING_PROXY_TOKEN":
+        config_db["proxy_token"] = text.strip()
+        await save_db_async("config", config_db)
+        admin_states.pop(user_id, None)
+        await update.message.reply_text("✅ Proxy token updated.", reply_markup=get_proxy_admin_keyboard())
+        return
+
+    if text == "⚡ Set Proxy API URL":
+        admin_states[user_id] = "WAITING_PROXY_API"
+        await update.message.reply_text(
+            "⚡ Send the new **Proxy API URL**:",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    if state == "WAITING_PROXY_API":
+        config_db["proxy_api_url"] = text.strip()
+        await save_db_async("config", config_db)
+        admin_states.pop(user_id, None)
+        await update.message.reply_text("✅ Proxy API URL updated.", reply_markup=get_proxy_admin_keyboard())
+        return
+
+    if text == "📧 Email Settings":
+        curr_server = str(config_db.get("email_server", "mail_tm"))
+        if curr_server == "mail_tm":
+            server_display = "Mail.tm Server"
+        else:
+            server_display = f"Venus Server {curr_server}"
+        e_price = config_db.get("prices", {}).get("MailTM", 0.01)
+        await update.message.reply_text(
+            f"📧 **Email Server Settings**\n\n"
+            f"🟢 **Active Server:** `{server_display}`\n"
+            f"💵 **Email Price:** `${e_price:.3f} USD`\n\n"
+            f"Select which email server should be active for users:",
+            parse_mode="Markdown",
+            reply_markup=get_email_admin_keyboard(curr_server)
+        )
+        return
+
+    if text in [
+        "1️⃣ Venus Server 1", "2️⃣ Venus Server 2", "🌐 Mail.tm Server",
+        "✅ Venus Server 1 (Active)", "✅ Venus Server 2 (Active)", "✅ Mail.tm Server (Active)"
+    ]:
+        if "Mail.tm" in text:
+            selected_server = "mail_tm"
+            server_title = "Mail.tm Server"
+        elif "Server 2" in text:
+            selected_server = "2"
+            server_title = "Venus Server 2"
+        else:
+            selected_server = "1"
+            server_title = "Venus Server 1"
+
+        config_db["email_server"] = selected_server
+        await save_db_async("config", config_db)
+        await update.message.reply_text(
+            f"✅ **Active Email Server Switched!**\n\nAll email purchases and OTP checks will now use **{server_title}**.",
+            parse_mode="Markdown",
+            reply_markup=get_email_admin_keyboard(selected_server)
+        )
+        return
+
+    if text == "🔑 Set Venus API Key":
+        admin_states[user_id] = "WAITING_VENUS_API_KEY"
+        curr_key = config_db.get("email_token", DEFAULT_VENUS_API_KEY)
+        await update.message.reply_text(
+            f"🔑 **Current Venus API Key:**\n`{curr_key}`\n\nSend the new Venus API Key:",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    if state == "WAITING_VENUS_API_KEY":
+        config_db["email_token"] = text.strip()
+        await save_db_async("config", config_db)
+        admin_states.pop(user_id, None)
+        await update.message.reply_text(
+            "✅ Venus API Key updated.",
+            reply_markup=get_email_admin_keyboard(config_db.get("email_server", "mail_tm"))
+        )
+        return
+
+    if text == "🔗 Set Venus API URL":
+        admin_states[user_id] = "WAITING_VENUS_API_URL"
+        curr_url = config_db.get("email_api_url", DEFAULT_VENUS_BASE_URL)
+        await update.message.reply_text(
+            f"🔗 **Current Venus API URL:**\n`{curr_url}`\n\nSend the new Venus API Base URL:",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    if state == "WAITING_VENUS_API_URL":
+        config_db["email_api_url"] = text.strip()
+        await save_db_async("config", config_db)
+        admin_states.pop(user_id, None)
+        await update.message.reply_text(
+            "✅ Venus API URL updated.",
+            reply_markup=get_email_admin_keyboard(config_db.get("email_server", "mail_tm"))
         )
         return
 
@@ -1260,9 +1675,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text.startswith("📧 Mail.tm"):
+    if text.startswith("📧 Email") or text.startswith("📧 Mail.tm"):
         admin_states[user_id] = "WAITING_PRICE_MailTM"
-        await update.message.reply_text("✍️ Enter new **Sell Price** for **MailTM**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+        await update.message.reply_text("✍️ Enter new **Sell Price** for **Email**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+        return
+
+    if text.startswith("🌐 Proxy"):
+        admin_states[user_id] = "WAITING_PRICE_Proxy"
+        await update.message.reply_text("✍️ Enter new **Sell Price** for **Proxy**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
 
     for _ck in get_all_country_keys():
@@ -1339,6 +1759,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_deposits = config_db.get("total_deposits", 0.0)
         total_spent = sum(u.get("total_spent", 0.0) for u in users_db.values())
         net_profit = total_spent - total_cost
+        today_num_cnt = get_total_today_usage_by_type("number")
+        today_email_cnt = get_total_today_usage_by_type("email")
+        today_proxy_cnt = get_total_today_usage_by_type("proxy")
 
         stats_msg = (
             f"📊 **BOT STATISTICS**\n"
@@ -1346,7 +1769,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 **Total Users:** `{total_users}`\n"
             f"💵 **Users Balance:** `${total_bal:.3f} USD`\n\n"
             + "\n\n".join(inv_lines) +
-            f"\n\n💰 **Financials:**\n"
+            f"\n\n📅 **Today's Activity (Iran Time):**\n"
+            f"   ├ 📱 Numbers Assigned: `{today_num_cnt}`\n"
+            f"   ├ 📧 Emails Purchased: `{today_email_cnt}`\n"
+            f"   └ 🌐 Proxies Purchased: `{today_proxy_cnt}`\n"
+            f"\n💰 **Financials:**\n"
             f"   ├ Total Deposits: `${total_deposits:.3f}`\n"
             f"   ├ Total Sales: `${total_spent:.3f}`\n"
             f"   └ **Net Profit:** `${net_profit:.3f} USD`"
@@ -1610,6 +2037,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = admin_states.get(user_id)
     doc_name = update.message.document.file_name
 
+    if state == "WAITING_PROXY_TOKEN":
+        file = await context.bot.get_file(update.message.document.file_id)
+        file_path = "temp_proxy_token.txt"
+        await file.download_to_drive(file_path)
+        with open(file_path, "r", encoding="utf-8") as f:
+            token_content = f.read().strip()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        config_db["proxy_token"] = token_content
+        await save_db_async("config", config_db)
+        admin_states.pop(user_id, None)
+        await update.message.reply_text("✅ Proxy token file loaded and saved.", reply_markup=get_proxy_admin_keyboard())
+        return
+
     if doc_name and doc_name.endswith('.zip'):
         status_msg = await update.message.reply_text("⏳ Restoring SQLite database from backup...")
         file = await context.bot.get_file(update.message.document.file_id)
@@ -1619,7 +2060,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(".")
             os.remove(zip_path)
-            global data, users_db, config_db, mail_tokens_db
+            global data, users_db, config_db, mail_tokens_db, proxies_db, history_db
+            proxies_db = load_db("proxies", {"proxies": []})
+            history_db = load_db("history", [])
             data = load_db("data", {"USA": [], "China": [], "Canada": [], "used_names": [], "canceled": []})
             for _ck in ["USA", "China", "Canada"]:
                 if _ck not in data:
@@ -1809,6 +2252,75 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⏳ No code received yet. Please wait a few seconds and try again.", show_alert=True)
         return
 
+    # ==========================================
+    # Venus Server 1 & 2 Get Code Callback
+    # ==========================================
+    if action.startswith("get_code_venus_"):
+        req_id = action.replace("get_code_venus_", "")
+        session_key = f"venus_{req_id}"
+        item_data = mail_tokens_db.get(session_key, {})
+
+        if item_data.get("user_id") and item_data.get("user_id") != user_id:
+            await query.answer("⛔ Unauthorized.", show_alert=True)
+            return
+
+        current_attempts = email_retry_counts.get(req_id, 0)
+        if current_attempts >= 3:
+            await query.answer("❌ Maximum code check attempts (3) reached for this email.", show_alert=True)
+            return
+
+        api_key = config_db.get("email_token", DEFAULT_VENUS_API_KEY)
+        base_url = config_db.get("email_api_url", DEFAULT_VENUS_BASE_URL)
+        if not base_url.endswith("/"):
+            base_url += "/"
+
+        res = None
+        try:
+            url = f"{base_url}getCode/?key={api_key}&id={req_id}"
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=12.0)
+                res = resp.json()
+            email_retry_counts[req_id] = current_attempts + 1
+        except Exception as e:
+            logging.error(f"Venus getCode error: {e}")
+            res = None
+
+        code = None
+        if res and isinstance(res, dict):
+            raw_code = str(res.get("code") or (res.get("result", {}).get("code") if isinstance(res.get("result"), dict) else ""))
+            match_code = re.search(r'\b\d{5,6}\b', raw_code)
+            if match_code:
+                code = match_code.group(0)
+
+        if code:
+            email_addr = item_data.get("email", "N/A")
+            srv_num = item_data.get("server", "1")
+            if session_key in mail_tokens_db:
+                mail_tokens_db[session_key].setdefault("codes", []).append(code)
+                await save_db_async("mail_tokens", mail_tokens_db)
+
+            new_text = (
+                f"📧 **Temporary Email (Venus Server {srv_num})**\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✉️ **Email:** `{email_addr}`\n"
+                f"🔐 **Verification Code:** `{code}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ *Code received successfully!*"
+            )
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📋 Copy Code: {code}", copy_text=CopyTextButton(text=str(code)))]
+            ])
+            try:
+                await query.edit_message_text(text=new_text, parse_mode="Markdown", reply_markup=markup)
+            except Exception as e:
+                logging.error(f"Edit message error in get_code_venus: {e}")
+            await query.answer("✅ Code received!")
+            email_retry_counts.pop(req_id, None)
+        else:
+            attempts_left = 3 - (current_attempts + 1)
+            await query.answer(f"⏳ No code arrived yet. Remaining checks: {attempts_left}", show_alert=True)
+        return
+
     if action == "deposit_bep20":
         admin_states[user_id] = "WAITING_DEPOSIT_AMOUNT"
         await query.answer()
@@ -1943,7 +2455,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data["used_numbers"].append(num_str)
         
         u_rec["balance"] = round(u_rec["balance"] - price, 4)
-        await save_db_async("users", users_db)
+        await log_usage_action(user_id, "number")
         
         item["status"] = "used"
         item["user_id"] = user_id
@@ -2100,27 +2612,47 @@ async def post_init(application: Application):
     asyncio.create_task(nightly_report_worker(application))
     asyncio.create_task(prefetch_mail_tm_pool())
 
-    async def periodic_backup():
+    async def hourly_iran_backup():
         while True:
-            await asyncio.sleep(3600)
-            try:
-                backup_filename = await asyncio.to_thread(create_backup_zip)
-                if os.path.exists(backup_filename):
-                    with open(backup_filename, "rb") as f:
-                        await application.bot.send_document(
-                            chat_id=ADMIN_ID,
-                            document=f,
-                            filename=backup_filename,
-                            caption="⏰ **Automatic 1-Hour Database Backup**",
-                            parse_mode="Markdown"
-                        )
-            except Exception as e:
-                logging.error(f"Backup error: {e}")
-                
-    asyncio.create_task(periodic_backup())
+            now_iran = datetime.now(IRAN_TZ)
+            next_hour = now_iran.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            sleep_seconds = max(1.0, (next_hour - now_iran).total_seconds())
+            await asyncio.sleep(sleep_seconds)
+
+            run_time_iran = datetime.now(IRAN_TZ).strftime('%Y-%m-%d %H:%M')
+            for attempt in range(2):
+                try:
+                    backup_filename = await asyncio.to_thread(create_backup_zip)
+                    if os.path.exists(backup_filename):
+                        with open(backup_filename, "rb") as f:
+                            await application.bot.send_document(
+                                chat_id=ADMIN_ID,
+                                document=f,
+                                filename=backup_filename,
+                                caption=(
+                                    f"⏰ **Automatic Hourly Database Backup (Iran Time)**\n"
+                                    f"🕒 Sent at: `{run_time_iran}`\n"
+                                    f"Contains the latest SQLite database snapshot for Render persistence."
+                                ),
+                                parse_mode="Markdown"
+                            )
+                    break
+                except Exception as e:
+                    logging.error(f"Hourly Iran backup error (attempt {attempt + 1}): {e}")
+                    if attempt == 0:
+                        await asyncio.sleep(5)
+
+    asyncio.create_task(hourly_iran_backup())
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    request = HTTPXRequest(
+        connection_pool_size=20,
+        connect_timeout=20.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=20.0,
+    )
+    app = ApplicationBuilder().token(TOKEN).request(request).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -2130,7 +2662,7 @@ def main():
     app.add_error_handler(error_handler)
 
     print("🤖 Bot is running...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
