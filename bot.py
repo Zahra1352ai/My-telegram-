@@ -2034,6 +2034,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != ADMIN_ID:
         return
 
+    global data, users_db, config_db, mail_tokens_db, proxies_db, history_db
     state = admin_states.get(user_id)
     doc_name = update.message.document.file_name
 
@@ -2060,7 +2061,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(".")
             os.remove(zip_path)
-            global data, users_db, config_db, mail_tokens_db, proxies_db, history_db
             proxies_db = load_db("proxies", {"proxies": []})
             history_db = load_db("history", [])
             data = load_db("data", {"USA": [], "China": [], "Canada": [], "used_names": [], "canceled": []})
