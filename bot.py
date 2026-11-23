@@ -35,6 +35,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ==========================================
 MAIL_TM_BASE = "https://api.mail.tm"
 mail_tm_pool = []
+used_mail_addresses = set()
 
 # ==========================================
 # Web Server to keep the bot alive on Render
@@ -144,14 +145,32 @@ DEFAULT_COUNTRY_SETTINGS = {
 }
 
 # Load database tables
-data = load_db("data", {"USA": [], "China": [], "Canada": [], "used_names": [], "canceled": []})
+data = load_db("data", {"USA": [], "China": [], "Canada": [], "used_names": [], "used_numbers": [], "canceled": []})
 for _ck in ["USA", "China", "Canada"]:
     if _ck not in data:
         data[_ck] = []
 if "used_names" not in data:
     data["used_names"] = []
+if "used_numbers" not in data:
+    data["used_numbers"] = []
 if "canceled" not in data:
     data["canceled"] = []
+
+used_names_set = set(data.get("used_names", []))
+used_numbers_set = set(data.get("used_numbers", []))
+for _c_init in list(data.keys()):
+    if isinstance(data[_c_init], list) and _c_init not in ["used_names", "used_numbers", "canceled"]:
+        for _itm in data[_c_init]:
+            if isinstance(_itm, dict) and _itm.get("number"):
+                if _itm.get("status") != "free":
+                    used_numbers_set.add(str(_itm["number"]))
+                if _itm.get("identity"):
+                    used_names_set.add(str(_itm["identity"]))
+for _citm in data.get("canceled", []):
+    if isinstance(_citm, dict) and _citm.get("number"):
+        used_numbers_set.add(str(_citm["number"]))
+data["used_names"] = list(used_names_set)
+data["used_numbers"] = list(used_numbers_set)
 
 users_db = load_db("users", {})
 config_db = load_db("config", {
@@ -164,6 +183,9 @@ config_db = load_db("config", {
     "custom_countries": {}
 })
 mail_tokens_db = load_db("mail_tokens", {})
+for _mt_val in mail_tokens_db.values():
+    if isinstance(_mt_val, dict) and _mt_val.get("email"):
+        used_mail_addresses.add(_mt_val["email"])
 
 config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
 config_db["prices"].setdefault("USA", 0.175)
@@ -246,9 +268,12 @@ async def create_mail_tm_account():
                 return None, None
             domain = domains[0]["domain"]
 
-            username = f"user_{int(time.time())}_{random.randint(1000, 9999)}"
-            password = "SecurePassword123!"
-            address = f"{username}@{domain}"
+            for _ in range(10):
+                username = f"user_{int(time.time() * 1000)}_{random.randint(10000, 99999)}"
+                address = f"{username}@{domain}"
+                if address not in used_mail_addresses and address not in {x["address"] for x in mail_tm_pool}:
+                    break
+            password = f"SecPass_{random.randint(100000, 999999)}!"
 
             reg_res = await client.post(f"{MAIL_TM_BASE}/accounts", json={
                 "address": address,
@@ -263,6 +288,7 @@ async def create_mail_tm_account():
                 if token_res.status_code in [200, 201]:
                     token = token_res.json().get("token")
                     if token:
+                        used_mail_addresses.add(address)
                         return address, token
     except Exception as e:
         logging.error(f"Exception in create_mail_tm_account: {e}")
@@ -334,17 +360,25 @@ def create_backup_zip():
             os.remove(snapshot_db)
     return backup_filename
 
-async def get_unique_name(country):
-    while True:
+def generate_unique_name_sync(country):
+    for _ in range(500):
         if country == "China":
             name = f"{fake_zh.first_name()} {fake_zh.last_name()}"
         else:
             name = f"{fake_en.first_name()} {fake_en.last_name()}"
-            
-        if name not in data["used_names"]:
+        if name not in used_names_set:
+            used_names_set.add(name)
             data["used_names"].append(name)
-            await save_db_async("data", data)
             return name
+    fallback = f"User_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+    used_names_set.add(fallback)
+    data["used_names"].append(fallback)
+    return fallback
+
+async def get_unique_name(country):
+    name = generate_unique_name_sync(country)
+    await save_db_async("data", data)
+    return name
 
 def process_data_line(line, country="USA"):
     line = line.strip()
@@ -560,16 +594,21 @@ async def auto_refund_worker(application: Application):
                                 refund_amount = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
                                 u_rec["balance"] = round(u_rec.get("balance", 0.0) + refund_amount, 4)
                                 
+                                num_str = str(item.get("number", ""))
+                                if num_str:
+                                    used_numbers_set.add(num_str)
+                                    if num_str not in data["used_numbers"]:
+                                        data["used_numbers"].append(num_str)
                                 data.setdefault("canceled", []).append({
                                     "country": country,
-                                    "number": item.get("number", ""),
+                                    "number": num_str,
                                     "link": item.get("link", ""),
                                     "user_id": user_id,
                                     "reason": "auto_refund_15m",
                                     "ts": current_time
                                 })
-                                item["status"] = "free"
-                                item["user_id"] = None
+                                item["status"] = "nocode"
+                                item["cancel_reason"] = "auto_refund_15m"
                                 item["assigned_at"] = 0
                                 d_st = get_daily_stats()
                                 d_st[country]["nocode"] = d_st[country].get("nocode", 0) + 1
@@ -641,7 +680,8 @@ def get_price_country_keyboard():
     if row:
         rows.append(row)
     rows.append([f"📧 Mail.tm (${prices.get('MailTM', 0.01):.3f})", "➕ Add Number Menu"])
-    rows.append(["💲 Set Base Costs", "🔙 Back to Admin"])
+    rows.append(["🗑 Delete Number Menu", "💲 Set Base Costs"])
+    rows.append(["🔙 Back to Admin"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def get_prefix_choice_keyboard():
@@ -658,8 +698,8 @@ def get_delete_keyboard():
 
 def get_export_keyboard():
     return ReplyKeyboardMarkup([
-        ["✅ OTP Received", "⏳ No OTP"],
-        ["❌ Canceled", "🔙 Back to Admin"]
+        ["📦 Unreceived Numbers", "❌ Canceled & No OTP"],
+        ["✅ OTP Received", "🔙 Back to Admin"]
     ], resize_keyboard=True)
 
 def get_target_keyboard():
@@ -681,7 +721,7 @@ def build_country_selection_markup():
     prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
     buttons = []
     for c_key in get_all_country_keys():
-        free_cnt = len([n for n in data.get(c_key, []) if n.get("status") == "free"])
+        free_cnt = len([n for n in data.get(c_key, []) if n.get("status") == "free" and str(n.get("number", "")) not in used_numbers_set])
         if free_cnt > 0:
             cfg = get_country_config(c_key)
             p_val = prices.get(c_key, 0.175)
@@ -709,9 +749,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⛔ You have been banned from using this bot.")
             return
 
-    if len(context.args) > 0 and u_rec.get("referred_by") is None and str(user_id) not in users_db.get("dummy", {}):
-        referrer_id = context.args[0]
-        if referrer_id != str(user_id) and referrer_id in users_db:
+    if len(context.args) > 0 and u_rec.get("referred_by") is None and u_rec.get("total_purchased", 0) == 0 and len(u_rec.get("deposit_history", [])) == 0:
+        referrer_id = str(context.args[0]).strip()
+        if referrer_id.isdigit() and referrer_id != str(user_id) and referrer_id in users_db:
             u_rec["referred_by"] = referrer_id
             users_db[referrer_id]["referrals"] = users_db[referrer_id].get("referrals", 0) + 1
             await save_db_async("users", users_db)
@@ -1313,6 +1353,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(stats_msg, parse_mode="Markdown")
 
+        country_summary_lines = ["📋 **COUNTRY NUMBER BREAKDOWN**", "━━━━━━━━━━━━━━━━━━"]
+        for ck in get_all_country_keys():
+            cfg = get_country_config(ck)
+            c_all = data.get(ck, [])
+            c_avail = len([n for n in c_all if n.get("status") == "free"])
+            c_otp = len([n for n in c_all if n.get("status") == "used" and n.get("has_code", False)])
+            c_nocode_list = len([n for n in c_all if n.get("status") in ["nocode", "canceled"] or (n.get("status") == "used" and not n.get("has_code", False))])
+            country_summary_lines.append(
+                f"{cfg.get('label', ck)} **{ck}:**\n"
+                f"   ├ 🆓 Available: `{c_avail}`\n"
+                f"   ├ ✅ OTP Received: `{c_otp}`\n"
+                f"   └ ❌ No OTP / Canceled: `{c_nocode_list}`"
+            )
+        await update.message.reply_text("\n\n".join(country_summary_lines), parse_mode="Markdown")
+
         report = build_nightly_report()
         await update.message.reply_text(report, parse_mode="Markdown")
         return
@@ -1336,6 +1391,55 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(report, parse_mode="Markdown", reply_markup=get_admin_keyboard())
         return
 
+    if text == "🗑 Delete Number Menu":
+        custom_keys = list(config_db.get("custom_countries", {}).keys())
+        if not custom_keys:
+            await update.message.reply_text("❌ No custom number menus exist to delete.", reply_markup=get_price_country_keyboard())
+            return
+        rows = []
+        row = []
+        for ck in custom_keys:
+            lbl = get_country_config(ck).get("label", ck)
+            row.append(f"❌ Remove {lbl}")
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append(["🔙 Back to Admin"])
+        admin_states[user_id] = "DELETE_CUSTOM_COUNTRY_MENU"
+        await update.message.reply_text(
+            "🗑 **Delete Number Menu**\n\nSelect the custom menu you want to remove:",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        )
+        return
+
+    if state == "DELETE_CUSTOM_COUNTRY_MENU":
+        target_ck = None
+        for ck in list(config_db.get("custom_countries", {}).keys()):
+            lbl = get_country_config(ck).get("label", ck)
+            if text == f"❌ Remove {lbl}":
+                target_ck = ck
+                break
+        if not target_ck:
+            await update.message.reply_text("❌ Invalid selection. Choose a menu from the buttons.")
+            return
+        removed_cfg = config_db["custom_countries"].pop(target_ck, {})
+        config_db.get("prices", {}).pop(target_ck, None)
+        config_db.get("base_costs", {}).pop(target_ck, None)
+        data.pop(target_ck, None)
+        if "daily_stats" in config_db:
+            config_db["daily_stats"].pop(target_ck, None)
+        await save_all_dbs_async()
+        admin_states.pop(user_id, None)
+        await update.message.reply_text(
+            f"✅ Number menu **{removed_cfg.get('label', target_ck)}** has been deleted.",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+
     if text == "🗑 Delete":
         admin_states[user_id] = "DELETE_MENU"
         await update.message.reply_text("🗑 **Delete Management:**", parse_mode="Markdown", reply_markup=get_delete_keyboard())
@@ -1343,27 +1447,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == "DELETE_MENU":
         if text == "♻️ Delete Used (OTP Received)":
+            released_count = 0
+            deleted_count = 0
             for country in get_all_country_keys():
                 new_list = []
                 for n in data.get(country, []):
-                    if n.get("status") == "used":
-                        if n.get("has_code", False):
-                            continue
-                        else:
-                            n["status"] = "free"
-                            n["user_id"] = None
-                            n["assigned_at"] = 0
-                            new_list.append(n)
+                    st = n.get("status")
+                    if st == "used" and n.get("has_code", False):
+                        deleted_count += 1
+                        continue
+                    elif st in ["nocode", "canceled"] or (st == "used" and not n.get("has_code", False)):
+                        num_str = str(n.get("number", ""))
+                        used_numbers_set.discard(num_str)
+                        n["status"] = "free"
+                        n["user_id"] = None
+                        n["assigned_at"] = 0
+                        n.pop("cancel_reason", None)
+                        released_count += 1
+                        new_list.append(n)
                     else:
                         new_list.append(n)
                 data[country] = new_list
+            data["canceled"] = []
+            data["used_numbers"] = list(used_numbers_set)
             await save_db_async("data", data)
-            await update.message.reply_text("✅ OTP-Received deleted, No-OTP returned to free stock.", reply_markup=get_admin_keyboard())
+            await update.message.reply_text(
+                f"✅ Deleted `{deleted_count}` OTP-received numbers and restored `{released_count}` canceled/no-OTP numbers back to available stock.",
+                parse_mode="Markdown",
+                reply_markup=get_admin_keyboard()
+            )
             admin_states.pop(user_id, None)
             
         elif text == "🗑 Delete All Numbers":
             for ck in get_all_country_keys():
                 data[ck] = []
+            data["canceled"] = []
+            used_numbers_set.clear()
+            data["used_numbers"] = []
             await save_db_async("data", data)
             await update.message.reply_text("✅ All numbers cleared.", reply_markup=get_admin_keyboard())
             admin_states.pop(user_id, None)
@@ -1375,18 +1495,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state == "EXPORT_MENU":
-        if text == "✅ OTP Received":
+        if text == "📦 Unreceived Numbers":
+            export_lines = []
+            for country in get_all_country_keys():
+                for item in data.get(country, []):
+                    if item.get("status") == "free":
+                        export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
+            await send_export_file(update, export_lines, "unreceived_numbers.txt")
+            admin_states.pop(user_id, None)
+        elif text == "❌ Canceled & No OTP":
+            admin_states[user_id] = "EXPORT_CANCELED_NOCODE"
+            await update.message.reply_text("Export Canceled & No-OTP numbers for which users?", reply_markup=get_target_keyboard())
+        elif text == "✅ OTP Received":
             admin_states[user_id] = "EXPORT_OTP"
             await update.message.reply_text("Export OTP-received numbers for which users?", reply_markup=get_target_keyboard())
-        elif text == "⏳ No OTP":
-            admin_states[user_id] = "EXPORT_NOCODE"
-            await update.message.reply_text("Export No-OTP numbers for which users?", reply_markup=get_target_keyboard())
-        elif text == "❌ Canceled":
-            admin_states[user_id] = "EXPORT_CANCELED"
-            await update.message.reply_text("Export canceled numbers for which users?", reply_markup=get_target_keyboard())
         return
 
-    if state in ["EXPORT_OTP", "EXPORT_NOCODE", "EXPORT_CANCELED"]:
+    if state in ["EXPORT_OTP", "EXPORT_CANCELED_NOCODE"]:
         if text == "🌐 All Users":
             export_lines = []
             if state == "EXPORT_OTP":
@@ -1395,16 +1520,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if item.get("status") == "used" and item.get("has_code", False):
                             export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
                 await send_export_file(update, export_lines, "otp_received.txt")
-            elif state == "EXPORT_NOCODE":
+            elif state == "EXPORT_CANCELED_NOCODE":
+                seen_pairs = set()
                 for country in get_all_country_keys():
                     for item in data.get(country, []):
-                        if item.get("status") == "used" and not item.get("has_code", False):
-                            export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
-                await send_export_file(update, export_lines, "no_otp.txt")
-            elif state == "EXPORT_CANCELED":
+                        if item.get("status") in ["nocode", "canceled"] or (item.get("status") == "used" and not item.get("has_code", False)):
+                            pair = f"{item.get('number', '')}:{item.get('link', '')}"
+                            if pair not in seen_pairs:
+                                seen_pairs.add(pair)
+                                export_lines.append(pair)
                 for item in data.get("canceled", []):
-                    export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
-                await send_export_file(update, export_lines, "canceled_numbers.txt")
+                    pair = f"{item.get('number', '')}:{item.get('link', '')}"
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        export_lines.append(pair)
+                await send_export_file(update, export_lines, "canceled_and_no_otp.txt")
             admin_states.pop(user_id, None)
         elif text == "👤 Specific User":
             admin_states[user_id] = f"WAITING_{state}_ID"
@@ -1421,17 +1551,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if item.get("status") == "used" and item.get("has_code", False) and item.get("user_id") == target_id:
                             export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
                 fname = f"user_{target_id}_otp_received.txt"
-            elif "EXPORT_NOCODE" in state:
+            elif "EXPORT_CANCELED_NOCODE" in state:
+                seen_pairs = set()
                 for country in get_all_country_keys():
                     for item in data.get(country, []):
-                        if item.get("status") == "used" and not item.get("has_code", False) and item.get("user_id") == target_id:
-                            export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
-                fname = f"user_{target_id}_no_otp.txt"
-            elif "EXPORT_CANCELED" in state:
+                        if item.get("user_id") == target_id and (item.get("status") in ["nocode", "canceled"] or (item.get("status") == "used" and not item.get("has_code", False))):
+                            pair = f"{item.get('number', '')}:{item.get('link', '')}"
+                            if pair not in seen_pairs:
+                                seen_pairs.add(pair)
+                                export_lines.append(pair)
                 for item in data.get("canceled", []):
                     if item.get("user_id") == target_id:
-                        export_lines.append(f"{item.get('number', '')}:{item.get('link', '')}")
-                fname = f"user_{target_id}_canceled.txt"
+                        pair = f"{item.get('number', '')}:{item.get('link', '')}"
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            export_lines.append(pair)
+                fname = f"user_{target_id}_canceled_and_no_otp.txt"
             else:
                 fname = f"user_{target_id}.txt"
             await send_export_file(update, export_lines, fname)
@@ -1512,6 +1647,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             config_db.setdefault("custom_countries", {})
             config_db.setdefault("country_settings", json.loads(json.dumps(DEFAULT_COUNTRY_SETTINGS)))
             mail_tokens_db = load_db("mail_tokens", {})
+            data.setdefault("used_names", [])
+            data.setdefault("used_numbers", [])
+            used_names_set.clear()
+            used_names_set.update(data["used_names"])
+            used_numbers_set.clear()
+            used_numbers_set.update(data["used_numbers"])
+            for _ck_r in get_all_country_keys():
+                for _itm_r in data.get(_ck_r, []):
+                    if _itm_r.get("status") != "free" and _itm_r.get("number"):
+                        used_numbers_set.add(str(_itm_r["number"]))
+            data["used_numbers"] = list(used_numbers_set)
+            for _mt_v in mail_tokens_db.values():
+                if isinstance(_mt_v, dict) and _mt_v.get("email"):
+                    used_mail_addresses.add(_mt_v["email"])
             await save_all_dbs_async()
             prices = config_db["prices"]
             wallet = config_db["usdt_bep20_address"]
@@ -1544,15 +1693,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(file_path)
         
         valid_count = 0
+        skipped_dup = 0
+        existing_in_stock = set()
+        for _ck_chk in get_all_country_keys():
+            for _itm_chk in data.get(_ck_chk, []):
+                if _itm_chk.get("number"):
+                    existing_in_stock.add(str(_itm_chk["number"]))
+
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
         
         for line in lines:
             link, phone = process_data_line(line, country)
             if link and phone:
-                unique_name = await get_unique_name(country)
+                phone_str = str(phone)
+                if phone_str in used_numbers_set or phone_str in existing_in_stock:
+                    skipped_dup += 1
+                    continue
+                existing_in_stock.add(phone_str)
+                unique_name = generate_unique_name_sync(country)
                 data[country].append({
-                    "number": phone, "link": link, "identity": unique_name,
+                    "number": phone_str, "link": link, "identity": unique_name,
                     "status": "free", "user_id": None, "assigned_at": 0,
                     "has_code": False, "batch_id": batch_id
                 })
@@ -1560,7 +1721,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
         await save_db_async("data", data)
         os.remove(file_path)
-        await status_msg.edit_text(f"✅ File Processed! Added: `{valid_count}` numbers.", parse_mode="Markdown")
+        dup_note = f" (Skipped duplicates: `{skipped_dup}`)" if skipped_dup else ""
+        await status_msg.edit_text(f"✅ File Processed! Added: `{valid_count}` numbers.{dup_note}", parse_mode="Markdown")
         await update.message.reply_text("⚙️ Back to Admin Panel:", reply_markup=get_admin_keyboard())
         admin_states.pop(user_id, None)
 
@@ -1685,8 +1847,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         config_db["total_deposits"] = round(config_db.get("total_deposits", 0.0) + amount, 4)
         
         if target_rec.get("referred_by"):
-            ref_id = target_rec["referred_by"]
-            if ref_id in users_db:
+            ref_id = str(target_rec["referred_by"])
+            if ref_id in users_db and ref_id != str(target_id):
                 ref_rec = users_db[ref_id]
                 commission = round(amount * 0.03, 4)
                 ref_rec["balance"] = round(ref_rec.get("balance", 0.0) + commission, 4)
@@ -1695,7 +1857,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         chat_id=int(ref_id),
-                        text=f"🎁 **Referral Commission!**\n\nYou earned `${commission:.4f} USDT` from a referral's deposit.",
+                        text=f"🎁 **Referral Commission (3%)!**\n\nYour referral deposited `${amount:.2f} USDT` and you earned `${commission:.4f} USDT`!",
                         parse_mode="Markdown"
                     )
                 except Exception:
@@ -1764,13 +1926,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"❌ Insufficient balance!\nPrice: ${price:.3f} USD\nYour Balance: ${u_rec.get('balance', 0.0):.3f} USD", show_alert=True)
             return
 
-        free_indices = [i for i, n in enumerate(data.get(country, [])) if n.get("status") == "free"]
+        free_indices = [
+            i for i, n in enumerate(data.get(country, []))
+            if n.get("status") == "free" and str(n.get("number", "")) not in used_numbers_set
+        ]
         if not free_indices:
             await query.answer(f"❌ Out of stock for {country}!", show_alert=True)
             return
 
         idx = free_indices[0]
         item = data[country][idx]
+        num_str = str(item.get("number", ""))
+        if num_str:
+            used_numbers_set.add(num_str)
+            if num_str not in data["used_numbers"]:
+                data["used_numbers"].append(num_str)
         
         u_rec["balance"] = round(u_rec["balance"] - price, 4)
         await save_db_async("users", users_db)
@@ -1831,16 +2001,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u_rec["canceled_count"] = u_rec.get("canceled_count", 0) + 1
         await save_db_async("users", users_db)
         
+        num_str = str(item.get("number", ""))
+        if num_str:
+            used_numbers_set.add(num_str)
+            if num_str not in data["used_numbers"]:
+                data["used_numbers"].append(num_str)
         data.setdefault("canceled", []).append({
             "country": country,
-            "number": item.get("number", ""),
+            "number": num_str,
             "link": item.get("link", ""),
             "user_id": user_id,
             "reason": "user_canceled",
             "ts": time.time()
         })
-        item["status"] = "free"
-        item["user_id"] = None
+        item["status"] = "canceled"
+        item["cancel_reason"] = "user_canceled"
         item["assigned_at"] = 0
         d_st = get_daily_stats()
         d_st[country]["nocode"] = d_st[country].get("nocode", 0) + 1
