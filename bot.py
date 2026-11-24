@@ -199,6 +199,9 @@ users_db = load_db("users", {})
 history_db = load_db("history", [])
 if not isinstance(history_db, list):
     history_db = []
+invoices_db = load_db("invoices", [])
+if not isinstance(invoices_db, list):
+    invoices_db = []
 proxies_db = load_db("proxies", {"proxies": []})
 if "proxies" not in proxies_db or not isinstance(proxies_db["proxies"], list):
     proxies_db["proxies"] = []
@@ -447,6 +450,7 @@ def save_all_dbs():
             ("mail_tokens", mail_tokens_db),
             ("proxies", proxies_db),
             ("history", history_db),
+            ("invoices", invoices_db),
         ]
         for k, obj in items:
             val_str = json.dumps(obj, ensure_ascii=False)
@@ -555,6 +559,10 @@ def get_user_record(user_id):
         users_db[u_str]["proxy_expires_at"] = 0.0
     if "proxy_subscribed_at" not in users_db[u_str]:
         users_db[u_str]["proxy_subscribed_at"] = 0.0
+    if "purchase_logs" not in users_db[u_str]:
+        users_db[u_str]["purchase_logs"] = []
+    if "balance_adjustments" not in users_db[u_str]:
+        users_db[u_str]["balance_adjustments"] = []
     return users_db[u_str]
 
 def has_active_proxy_membership(u_rec, now_ts=None):
@@ -593,15 +601,28 @@ def get_total_today_usage_by_type(item_type):
     _sync_daily_usage_cache()
     return _daily_usage_cache["total"].get(item_type, 0)
 
-async def log_usage_action(user_id, item_type):
+async def log_usage_action(user_id, item_type, detail="", price=0.0, extra=None):
     global history_db
     u_rec = get_user_record(user_id)
+    now_ts = time.time()
+    iran_dt = datetime.fromtimestamp(now_ts, IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
     if item_type == "number":
         u_rec["total_used_numbers"] = u_rec.get("total_used_numbers", 0) + 1
     elif item_type == "email":
         u_rec["total_used_emails"] = u_rec.get("total_used_emails", 0) + 1
     elif item_type == "proxy":
         u_rec["total_used_proxies"] = u_rec.get("total_used_proxies", 0) + 1
+
+    purchase_entry = {
+        "type": item_type,
+        "detail": str(detail),
+        "price": round(float(price or 0.0), 4),
+        "ts": now_ts,
+        "date_iran": iran_dt
+    }
+    if extra and isinstance(extra, dict):
+        purchase_entry.update(extra)
+    u_rec.setdefault("purchase_logs", []).append(purchase_entry)
     await save_db_async("users", users_db)
 
     today_str = get_today_iran_str()
@@ -609,17 +630,18 @@ async def log_usage_action(user_id, item_type):
     _daily_usage_cache["user"][(str(user_id), item_type)] = _daily_usage_cache["user"].get((str(user_id), item_type), 0) + 1
     _daily_usage_cache["total"][item_type] = _daily_usage_cache["total"].get(item_type, 0) + 1
 
-    history_db.append({
+    hist_entry = {
         "user_id": int(user_id),
         "type": item_type,
-        "ts": time.time(),
-        "date": today_str
-    })
-    if len(history_db) > 5000:
-        history_db = [
-            h for h in history_db
-            if h.get("date", datetime.fromtimestamp(h.get("ts", 0), IRAN_TZ).strftime('%Y-%m-%d')) == today_str
-        ]
+        "detail": str(detail),
+        "price": round(float(price or 0.0), 4),
+        "ts": now_ts,
+        "date": today_str,
+        "date_iran": iran_dt
+    }
+    if extra and isinstance(extra, dict):
+        hist_entry.update(extra)
+    history_db.append(hist_entry)
     await save_db_async("history", history_db)
 
 # ==========================================
@@ -654,7 +676,7 @@ def build_nightly_report():
     iran_tz = timezone(timedelta(hours=3, minutes=30))
     now_str = datetime.now(iran_tz).strftime("%Y-%m-%d %H:%M")
     
-    lines = [f"📊 **Nightly 24-Hour Report — {now_str} (Iran Time)**", "━━━━━━━━━━━━━━━━━━"]
+    lines = [f"?? **Nightly 24-Hour Report — {now_str} (Iran Time)**", "━━━━━━━━━━━━━━━━━━"]
     
     total_otp = 0
     total_assigned = 0
@@ -1080,7 +1102,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
                 u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
                 u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
-                await log_usage_action(user_id, "email")
+                await log_usage_action(user_id, "email", detail=email_addr, price=price, extra={"server": email_server})
 
                 req_key = f"mtm_{int(time.time())}_{random.randint(1000, 9999)}"
                 mail_tokens_db[req_key] = {
@@ -1147,7 +1169,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
             u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
             u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
-            await log_usage_action(user_id, "email")
+            await log_usage_action(user_id, "email", detail=email_addr, price=price, extra={"server": email_server})
 
             req_id_str = str(req_id)
             mail_tokens_db[f"venus_{req_id_str}"] = {
@@ -1259,6 +1281,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ])
         
+        inv_record = {
+            "invoice_id": f"INV_{int(time.time() * 1000)}_{user_id}",
+            "user_id": int(user_id),
+            "username": username_str,
+            "first_name": user_obj.first_name,
+            "amount": float(amount),
+            "tx_hash": tx_hash,
+            "status": "pending",
+            "created_at": time.time(),
+            "created_iran": datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        }
+        invoices_db.append(inv_record)
+        u_rec.setdefault("deposit_history", []).append({
+            "invoice_id": inv_record["invoice_id"],
+            "amount": float(amount),
+            "tx_hash": tx_hash,
+            "status": "pending",
+            "date": inv_record["created_iran"]
+        })
+        await save_db_async("invoices", invoices_db)
+        await save_db_async("users", users_db)
+
         invoice_sent = False
         try:
             await context.bot.send_message(
@@ -1428,20 +1472,91 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         target_rec = get_user_record(int(text))
         admin_states[user_id] = f"WAITING_BAL_AMOUNT_{text}"
-        await update.message.reply_text(f"👤 User ID: `{text}`\n💵 Current Balance: `${target_rec.get('balance', 0.0):.3f} USD`\n\n✍️ Enter amount to add/deduct:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+        await update.message.reply_text(
+            f"👤 **User ID:** `{text}`\n"
+            f"💵 **Current Balance:** `${target_rec.get('balance', 0.0):.3f} USD`\n\n"
+            f"✍️ Enter the amount in USD to add or deduct:\n"
+            f"• Example `5` to **add** `$5.00 USD`\n"
+            f"• Example `-4` to **deduct** `$4.00 USD`",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
         return
 
     if state and state.startswith("WAITING_BAL_AMOUNT_"):
         target_id = state.split("_")[-1]
         try:
-            amount = float(text)
+            amount = float(text.strip())
+            if amount == 0:
+                await update.message.reply_text("❌ Amount cannot be zero. Enter a positive or negative number (e.g., `5` or `-4`).", parse_mode="Markdown")
+                return
             target_rec = get_user_record(int(target_id))
-            target_rec["balance"] = round(max(0.0, target_rec.get("balance", 0.0) + amount), 4)
-            await save_db_async("users", users_db)
-            await update.message.reply_text(f"✅ Balance Updated for `{target_id}`. New: `${target_rec['balance']:.3f} USD`", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+            old_bal = float(target_rec.get("balance", 0.0))
+            new_bal = round(max(0.0, old_bal + amount), 4)
+            actual_diff = round(new_bal - old_bal, 4)
+            target_rec["balance"] = new_bal
+
+            now_ts = time.time()
+            iran_dt = datetime.fromtimestamp(now_ts, IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            adj_record = {
+                "type": "admin_balance_adjustment",
+                "user_id": int(target_id),
+                "requested_change": round(amount, 4),
+                "actual_change": actual_diff,
+                "old_balance": old_bal,
+                "new_balance": new_bal,
+                "ts": now_ts,
+                "date": get_today_iran_str(),
+                "date_iran": iran_dt
+            }
+            target_rec.setdefault("balance_adjustments", []).append(adj_record)
+            history_db.append(adj_record)
+            await save_all_dbs_async()
+
+            notified = False
+            try:
+                if amount > 0:
+                    user_notice = (
+                        f"💰 **BALANCE CREDITED**\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"➕ **Amount Added:** `+${amount:.3f} USD`\n"
+                        f"💵 **New Balance:** `${new_bal:.3f} USD`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"✅ *Your account balance has been increased by the admin.*"
+                    )
+                else:
+                    deducted_amt = abs(actual_diff) if actual_diff < 0 else abs(amount)
+                    user_notice = (
+                        f"💸 **BALANCE DEDUCTED**\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"➖ **Amount Deducted:** `-${deducted_amt:.3f} USD`\n"
+                        f"💵 **New Balance:** `${new_bal:.3f} USD`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"ℹ️ *This amount has been deducted from your account balance by the admin.*"
+                    )
+                await context.bot.send_message(
+                    chat_id=int(target_id),
+                    text=user_notice,
+                    parse_mode="Markdown"
+                )
+                notified = True
+            except Exception as notify_err:
+                logging.warning(f"Could not notify user {target_id} about balance change: {notify_err}")
+
+            notify_status = "📩 User notified." if notified else "⚠️ Balance saved, but user could not be messaged (has not started bot or blocked it)."
+            action_word = f"+${amount:.3f} USD added" if amount > 0 else f"-${abs(amount):.3f} USD deducted"
+            await update.message.reply_text(
+                f"✅ **Balance Updated for `{target_id}`**\n"
+                f"▫️ **Change:** `{action_word}`\n"
+                f"▫️ **Previous Balance:** `${old_bal:.3f} USD`\n"
+                f"▫️ **New Balance:** `${new_bal:.3f} USD`\n"
+                f"{notify_status}",
+                parse_mode="Markdown",
+                reply_markup=get_admin_keyboard()
+            )
             admin_states.pop(user_id, None)
         except ValueError:
-            await update.message.reply_text("❌ Invalid number format.")
+            await update.message.reply_text("❌ Invalid number format. Use e.g. `5` or `-4`.", parse_mode="Markdown")
         return
 
     if text == "💵 Set Prices":
@@ -2174,6 +2289,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(zip_path)
             proxies_db = load_db("proxies", {"proxies": []})
             history_db = load_db("history", [])
+            invoices_db = load_db("invoices", [])
             data = load_db("data", {"USA": [], "China": [], "Canada": [], "used_names": [], "canceled": []})
             for _ck in ["USA", "China", "Canada"]:
                 if _ck not in data:
@@ -2486,7 +2602,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         target_rec = get_user_record(int(target_id))
         target_rec["balance"] = round(target_rec.get("balance", 0.0) + amount, 4)
-        target_rec["deposit_history"].append({"amount": amount, "date": datetime.now().strftime("%Y-%m-%d %H:%M")})
+        now_iran_str = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        matched_inv = False
+        for inv in reversed(invoices_db):
+            if str(inv.get("user_id")) == str(target_id) and abs(float(inv.get("amount", 0)) - float(amount)) < 1e-6 and inv.get("status") == "pending":
+                inv["status"] = "approved"
+                inv["processed_iran"] = now_iran_str
+                matched_inv = True
+                break
+        if not matched_inv:
+            invoices_db.append({
+                "invoice_id": f"INV_{int(time.time() * 1000)}_{target_id}",
+                "user_id": int(target_id),
+                "amount": float(amount),
+                "status": "approved",
+                "processed_iran": now_iran_str
+            })
+        for dh in reversed(target_rec.get("deposit_history", [])):
+            if abs(float(dh.get("amount", 0)) - float(amount)) < 1e-6 and dh.get("status") == "pending":
+                dh["status"] = "approved"
+                dh["processed_date"] = now_iran_str
+                break
+        else:
+            target_rec["deposit_history"].append({"amount": amount, "status": "approved", "date": now_iran_str})
+        await save_db_async("invoices", invoices_db)
         
         config_db["total_deposits"] = round(config_db.get("total_deposits", 0.0) + amount, 4)
         
@@ -2527,6 +2666,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action.startswith("dep_reject_") and user_id == ADMIN_ID:
         parts = action.split("_")
         target_id = parts[2]
+        rej_amount = float(parts[3]) if len(parts) > 3 else 0.0
+        now_iran_str = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        for inv in reversed(invoices_db):
+            if str(inv.get("user_id")) == str(target_id) and abs(float(inv.get("amount", 0)) - rej_amount) < 1e-6 and inv.get("status") == "pending":
+                inv["status"] = "rejected"
+                inv["processed_iran"] = now_iran_str
+                break
+        t_rec = get_user_record(int(target_id))
+        for dh in reversed(t_rec.get("deposit_history", [])):
+            if abs(float(dh.get("amount", 0)) - rej_amount) < 1e-6 and dh.get("status") == "pending":
+                dh["status"] = "rejected"
+                dh["processed_date"] = now_iran_str
+                break
+        await save_db_async("invoices", invoices_db)
+        await save_db_async("users", users_db)
         await safe_edit_message_text(query, f"{query.message.text}\n\n❌ **REJECTED BY ADMIN**", parse_mode="Markdown")
         await query.answer("❌ Rejected.")
         try:
@@ -2594,7 +2748,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
         u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
         u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
-        await log_usage_action(user_id, "proxy")
+        await log_usage_action(user_id, "proxy", detail=u_rec.get("active_proxy", ""), price=price, extra={"plan": pm_label, "expires_at": new_exp_ts})
 
         exp_str = datetime.fromtimestamp(new_exp_ts, IRAN_TZ).strftime("%Y-%m-%d %H:%M")
         confirm_msg = (
@@ -2638,7 +2792,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data["used_numbers"].append(num_str)
         
         u_rec["balance"] = round(u_rec["balance"] - price, 4)
-        await log_usage_action(user_id, "number")
+        await log_usage_action(user_id, "number", detail=num_str, price=price, extra={"country": country})
         
         item["status"] = "used"
         item["user_id"] = user_id
