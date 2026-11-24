@@ -990,14 +990,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Failed to generate an email address right now. No balance was deducted. Please try again.")
             return
 
-        # Venus Server 1 or Venus Server 2
+        # Venus Server 1 or Venus Server 2 (unified UI & 2-code flow)
         api_key = config_db.get("email_token", DEFAULT_VENUS_API_KEY)
         base_url = config_db.get("email_api_url", DEFAULT_VENUS_BASE_URL)
         if not base_url.endswith("/"):
             base_url += "/"
 
         url = f"{base_url}getEmail/?key={api_key}&server={email_server}"
-        wait_msg = await update.message.reply_text(f"⏳ Requesting email from Venus Server {email_server}...")
+        wait_msg = await update.message.reply_text("⏳ Generating fresh email address...")
 
         try:
             async with httpx.AsyncClient() as client:
@@ -1006,12 +1006,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     res = response.json()
                 except Exception:
                     res = response.text
-        except Exception as e:
+        except Exception:
             try:
                 await wait_msg.delete()
             except Exception:
                 pass
-            await update.message.reply_text(f"❌ Server connection error. No balance was deducted.\n`{e}`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Failed to generate an email address right now. No balance was deducted. Please try again.")
             return
 
         try:
@@ -1045,19 +1045,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await save_db_async("mail_tokens", mail_tokens_db)
 
             msg = (
-                f"📧 **Temporary Email Assigned (Venus Server {email_server})**\n"
+                f"📧 **Temporary Email Assigned**\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"✉️ **Email:** `{email_addr}`\n"
                 f"💵 **Price:** `${price:.3f} USD`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💡 *Tap the email above to copy, request your verification code, then press* **Get Code** *below.*"
+                f"💡 *Tap the email above to copy, request your verification code, then press* **Get Code** *below (up to 2 codes per email).*"
             )
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Get Code", callback_data=f"get_code_venus_{req_id_str}")]
             ])
             await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
         else:
-            await update.message.reply_text("❌ No new emails available on this server right now. No balance was deducted.")
+            await update.message.reply_text("❌ Failed to generate an email address right now. No balance was deducted. Please try again.")
         return
 
     # ==========================================
@@ -1426,7 +1426,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text == "?? Delete All Proxies":
+    if text == "🗑 Delete All Proxies":
         proxies_db["proxies"] = []
         await save_db_async("proxies", proxies_db)
         await update.message.reply_text("✅ All proxies have been deleted.", reply_markup=get_proxy_admin_keyboard())
@@ -1789,7 +1789,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c_nocode_list = len([n for n in c_all if n.get("status") in ["nocode", "canceled"] or (n.get("status") == "used" and not n.get("has_code", False))])
             country_summary_lines.append(
                 f"{cfg.get('label', ck)} **{ck}:**\n"
-                f"   ├ 🆓 Available: `{c_avail}`\n"
+                f"   ├ ?? Available: `{c_avail}`\n"
                 f"   ├ ✅ OTP Received: `{c_otp}`\n"
                 f"   └ ❌ No OTP / Canceled: `{c_nocode_list}`"
             )
@@ -2221,7 +2221,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if attempts == 1:
                 new_text = (
-                    f"📧 **Mail.tm Temporary Email**\n"
+                    f"📧 **Temporary Email**\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"✉️ **Email:** `{email_addr}`\n"
                     f"🔐 **Code:** `{code}`\n"
@@ -2233,7 +2233,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             else:
                 new_text = (
-                    f"📧 **Mail.tm Temporary Email**\n"
+                    f"📧 **Temporary Email**\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"✉️ **Email:** `{email_addr}`\n"
                     f"🔐 **Code 1:** `{prev_codes[0]}`\n"
@@ -2253,20 +2253,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================================
-    # Venus Server 1 & 2 Get Code Callback
+    # Venus Server 1 & 2 Get Code Callback (Max 2 codes, unified UI)
     # ==========================================
     if action.startswith("get_code_venus_"):
         req_id = action.replace("get_code_venus_", "")
         session_key = f"venus_{req_id}"
-        item_data = mail_tokens_db.get(session_key, {})
+        item_data = mail_tokens_db.get(session_key)
+
+        if not item_data:
+            await query.answer("❌ Email session expired or not found.", show_alert=True)
+            return
 
         if item_data.get("user_id") and item_data.get("user_id") != user_id:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
 
-        current_attempts = email_retry_counts.get(req_id, 0)
-        if current_attempts >= 3:
-            await query.answer("❌ Maximum code check attempts (3) reached for this email.", show_alert=True)
+        attempts = item_data.get("attempts", 0)
+        if attempts >= 2:
+            await query.answer("⚠️ Maximum code checks (2) reached for this email.", show_alert=True)
             return
 
         api_key = config_db.get("email_token", DEFAULT_VENUS_API_KEY)
@@ -2280,7 +2284,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url, timeout=12.0)
                 res = resp.json()
-            email_retry_counts[req_id] = current_attempts + 1
         except Exception as e:
             logging.error(f"Venus getCode error: {e}")
             res = None
@@ -2294,31 +2297,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if code:
             email_addr = item_data.get("email", "N/A")
-            srv_num = item_data.get("server", "1")
-            if session_key in mail_tokens_db:
-                mail_tokens_db[session_key].setdefault("codes", []).append(code)
-                await save_db_async("mail_tokens", mail_tokens_db)
+            prev_codes = item_data.get("codes", [])
 
-            new_text = (
-                f"📧 **Temporary Email (Venus Server {srv_num})**\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"✉️ **Email:** `{email_addr}`\n"
-                f"🔐 **Verification Code:** `{code}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ *Code received successfully!*"
-            )
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"📋 Copy Code: {code}", copy_text=CopyTextButton(text=str(code)))]
-            ])
+            if attempts == 1 and prev_codes and code == prev_codes[-1]:
+                await query.answer("⏳ No new code arrived yet. Please wait and try again.", show_alert=True)
+                return
+
+            attempts += 1
+            prev_codes.append(code)
+            mail_tokens_db[session_key]["attempts"] = attempts
+            mail_tokens_db[session_key]["codes"] = prev_codes
+            await save_db_async("mail_tokens", mail_tokens_db)
+
+            if attempts == 1:
+                new_text = (
+                    f"📧 **Temporary Email**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✉️ **Email:** `{email_addr}`\n"
+                    f"🔐 **Code:** `{code}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✅ *Code received! Need a second code on this email? Click below:*"
+                )
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get Code Again", callback_data=f"get_code_venus_{req_id}")]
+                ])
+            else:
+                new_text = (
+                    f"📧 **Temporary Email**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✉️ **Email:** `{email_addr}`\n"
+                    f"🔐 **Code 1:** `{prev_codes[0]}`\n"
+                    f"🔐 **Code 2:** `{code}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✔️ *Both codes received. This email session is now complete.*"
+                )
+                markup = None
+
             try:
                 await query.edit_message_text(text=new_text, parse_mode="Markdown", reply_markup=markup)
             except Exception as e:
                 logging.error(f"Edit message error in get_code_venus: {e}")
             await query.answer("✅ Code received!")
-            email_retry_counts.pop(req_id, None)
         else:
-            attempts_left = 3 - (current_attempts + 1)
-            await query.answer(f"⏳ No code arrived yet. Remaining checks: {attempts_left}", show_alert=True)
+            await query.answer("⏳ No code received yet. Please wait a few seconds and try again.", show_alert=True)
         return
 
     if action == "deposit_bep20":
