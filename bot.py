@@ -551,7 +551,17 @@ def get_user_record(user_id):
         users_db[u_str]["active_proxy"] = ""
     if "active_proxy_plan" not in users_db[u_str]:
         users_db[u_str]["active_proxy_plan"] = ""
+    if "proxy_expires_at" not in users_db[u_str]:
+        users_db[u_str]["proxy_expires_at"] = 0.0
+    if "proxy_subscribed_at" not in users_db[u_str]:
+        users_db[u_str]["proxy_subscribed_at"] = 0.0
     return users_db[u_str]
+
+def has_active_proxy_membership(u_rec, now_ts=None):
+    if now_ts is None:
+        now_ts = time.time()
+    exp_ts = float(u_rec.get("proxy_expires_at", 0.0) or 0.0)
+    return exp_ts > now_ts
 
 def get_today_iran_str():
     return datetime.now(IRAN_TZ).strftime('%Y-%m-%d')
@@ -1183,10 +1193,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         proxy_intro = (
-            f"🌐 **Select a Proxy Package**\n"
+            f"🌐 **Monthly Proxy Membership**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"ℹ️ *Purchased proxies will be automatically displayed right below your assigned number whenever you buy a number.*\n\n"
-            f"👇 **Choose an available proxy package below:**"
+            f"📅 *Valid for 30 days (1 month) from purchase.*\n"
+            f"ℹ️ *Active members automatically receive a proxy below their assigned numbers until the 30-day membership expires.*\n\n"
+            f"👇 **Subscribe below:**"
         )
         await update.message.reply_text(proxy_intro, parse_mode="Markdown", reply_markup=markup)
         return
@@ -2565,30 +2576,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        last_idx = u_rec.get("last_proxy_idx", -1)
-        next_idx = (last_idx + 1) % len(proxy_list)
-        selected_proxy = proxy_list[next_idx]
+        now_ts = time.time()
+        thirty_days_sec = 30 * 24 * 3600
+        prev_exp = float(u_rec.get("proxy_expires_at", 0.0) or 0.0)
+        base_ts = prev_exp if prev_exp > now_ts else now_ts
+        new_exp_ts = base_ts + thirty_days_sec
 
-        u_rec["last_proxy_idx"] = next_idx
-        u_rec["active_proxy"] = selected_proxy
+        if not str(u_rec.get("active_proxy", "")).strip():
+            last_idx = u_rec.get("last_proxy_idx", -1)
+            next_idx = (last_idx + 1) % len(proxy_list)
+            u_rec["last_proxy_idx"] = next_idx
+            u_rec["active_proxy"] = proxy_list[next_idx]
+
         u_rec["active_proxy_plan"] = pm_label
+        u_rec["proxy_subscribed_at"] = now_ts
+        u_rec["proxy_expires_at"] = new_exp_ts
         u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
         u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
         u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
         await log_usage_action(user_id, "proxy")
 
+        exp_str = datetime.fromtimestamp(new_exp_ts, IRAN_TZ).strftime("%Y-%m-%d %H:%M")
         confirm_msg = (
-            f"✅ **PROXY PURCHASE CONFIRMED**\n"
+            f"✅ **MONTHLY PROXY MEMBERSHIP ACTIVATED**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 **Package:** {pm_label}\n"
+            f"📦 **Plan:** {pm_label} (30 Days)\n"
             f"💵 **Price:** `${price:.2f} USD`\n"
             f"💰 **Remaining Balance:** `${u_rec['balance']:.3f} USD`\n"
+            f"📅 **Valid Until:** `{exp_str}` (Iran Time)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔗 **Your Proxy (Tap to copy):**\n`{selected_proxy}`\n\n"
-            f"ℹ️ *This proxy will also appear automatically below every number you purchase.*"
+            f"ℹ️ *Your proxy will be delivered automatically below your assigned numbers while your membership is active.*"
         )
         await safe_edit_message_text(query, confirm_msg, parse_mode="Markdown")
-        await query.answer("✅ Proxy purchased!")
+        await query.answer("✅ Monthly proxy activated!")
         return
 
     if action.startswith("buy_country_") or action.startswith("buy_another_"):
@@ -2631,8 +2651,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_db_async("data", data)
 
         flag = get_country_config(country).get("label", country)
-        user_proxy = u_rec.get("active_proxy", "").strip()
-        proxy_footer = f"\n\n🌐 **Proxy (Tap to copy):**\n`{user_proxy}`" if user_proxy else ""
+        now_ts = time.time()
+        proxy_footer = ""
+        if has_active_proxy_membership(u_rec, now_ts):
+            proxy_list = proxies_db.get("proxies", [])
+            user_proxy = str(u_rec.get("active_proxy", "")).strip()
+            if not user_proxy and proxy_list:
+                last_idx = u_rec.get("last_proxy_idx", -1)
+                next_idx = (last_idx + 1) % len(proxy_list)
+                user_proxy = proxy_list[next_idx]
+                u_rec["last_proxy_idx"] = next_idx
+                u_rec["active_proxy"] = user_proxy
+                await save_db_async("users", users_db)
+            if user_proxy:
+                proxy_footer = f"\n\n🌐 **Proxy (Tap to copy):**\n`{user_proxy}`"
         
         num_msg = (
             f"📱 **NUMBER ASSIGNED**\n\n"
