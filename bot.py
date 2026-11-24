@@ -890,7 +890,7 @@ def get_price_country_keyboard():
         rows.append(row)
     rows.append([f"📧 Email (${prices.get('MailTM', 0.01):.3f})"])
     proxy_price = float(prices.get("Proxy", 5.0))
-    rows.append([f"🌐 Monthly $5 Proxy (${proxy_price:.2f})"])
+    rows.append([f"🌐 Monthly Proxy (${proxy_price:.2f})"])
     rows.append(["➕ Add Number Menu", "🗑 Delete Number Menu"])
     rows.append(["💲 Set Base Costs", "🔙 Back to Admin"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -944,7 +944,7 @@ def build_country_selection_markup():
 
 def build_proxy_selection_markup():
     proxy_price = float(config_db.get("prices", {}).get("Proxy", 5.0))
-    btn_label = f"🌐 Monthly $5 Proxy — ${proxy_price:.2f} USD"
+    btn_label = f"🌐 Monthly Proxy — ${proxy_price:.2f} USD"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(btn_label, callback_data="buy_proxy_menu_monthly_5")]
     ])
@@ -1442,7 +1442,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines_p.append(f"{cfg.get('label', ck)}: `${prices.get(ck, 0.175):.3f}` (Cost: ${base_costs.get(ck, 0.100):.3f})")
         proxy_price = float(prices.get("Proxy", 5.0))
         lines_p.append(f"📧 Email: `${prices.get('MailTM', 0.01):.3f}`")
-        lines_p.append(f"🌐 Monthly $5 Proxy: `${proxy_price:.2f}`")
+        lines_p.append(f"🌐 Monthly Proxy: `${proxy_price:.2f}`")
         lines_p.append("\nSelect an option to change price or manage number menus:")
         await update.message.reply_text(
             "\n".join(lines_p),
@@ -1768,9 +1768,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✍️ Enter new **Sell Price** for **Email**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
 
-    if text.startswith("🌐 Monthly $5 Proxy") or text.startswith("🌐 Proxy"):
+    if text.startswith("🌐 Monthly Proxy") or text.startswith("🌐 Proxy"):
         admin_states[user_id] = "WAITING_PRICE_Proxy"
-        await update.message.reply_text("✍️ Enter new **Sell Price** for **Monthly $5 Proxy**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+        await update.message.reply_text("✍️ Enter new **Sell Price** for **Monthly Proxy**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
 
     for _ck in get_all_country_keys():
@@ -2556,7 +2556,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         price = float(config_db.get("prices", {}).get("Proxy", 5.0))
-        pm_label = "🌐 Monthly $5 Proxy"
+        pm_label = "🌐 Monthly Proxy"
 
         if u_rec.get("balance", 0.0) < price:
             await query.answer(
