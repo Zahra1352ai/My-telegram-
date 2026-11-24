@@ -227,25 +227,13 @@ config_db["prices"].setdefault("USA", 0.175)
 config_db["prices"].setdefault("China", 0.195)
 config_db["prices"].setdefault("Canada", 0.175)
 config_db["prices"].setdefault("MailTM", 0.01)
-config_db["prices"].setdefault("Proxy", 0.05)
+config_db["prices"].setdefault("Proxy", 5.0)
 config_db.setdefault("email_server", "mail_tm")
 config_db.setdefault("email_token", DEFAULT_VENUS_API_KEY)
 config_db.setdefault("email_api_url", DEFAULT_VENUS_BASE_URL)
 config_db.setdefault("proxy_token", "")
 config_db.setdefault("proxy_api_url", "")
-config_db.setdefault("proxy_menus", {
-    "proxy_5gb": {
-        "label": "🌐 5GB Proxy",
-        "price": 5.0
-    }
-})
-if not isinstance(config_db["proxy_menus"], dict):
-    config_db["proxy_menus"] = {
-        "proxy_5gb": {
-            "label": "🌐 5GB Proxy",
-            "price": 5.0
-        }
-    }
+config_db.pop("proxy_menus", None)
 
 config_db.setdefault("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
 config_db["base_costs"].setdefault("USA", 0.100)
@@ -869,8 +857,7 @@ def get_email_admin_keyboard(current_server="mail_tm"):
 def get_proxy_admin_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Add Proxy", "🗑 Delete All Proxies"],
-        ["📋 View Proxies", "➕ Add Proxy Menu"],
-        ["🗑 Delete Proxy Menu", "🔑 Set Proxy Token"],
+        ["📋 View Proxies", "🔑 Set Proxy Token"],
         ["⚡ Set Proxy API URL", "🔙 Back to Admin"]
     ], resize_keyboard=True)
 
@@ -902,19 +889,9 @@ def get_price_country_keyboard():
     if row:
         rows.append(row)
     rows.append([f"📧 Email (${prices.get('MailTM', 0.01):.3f})"])
-    p_menus = config_db.get("proxy_menus", {})
-    p_row = []
-    for pm_key, pm_cfg in p_menus.items():
-        pm_lbl = pm_cfg.get("label", pm_key)
-        pm_price = float(pm_cfg.get("price", 5.0))
-        p_row.append(f"🌐 {pm_lbl} (${pm_price:.2f})")
-        if len(p_row) == 2:
-            rows.append(p_row)
-            p_row = []
-    if p_row:
-        rows.append(p_row)
+    proxy_price = float(prices.get("Proxy", 5.0))
+    rows.append([f"🌐 Monthly $5 Proxy (${proxy_price:.2f})"])
     rows.append(["➕ Add Number Menu", "🗑 Delete Number Menu"])
-    rows.append(["➕ Add Proxy Menu", "🗑 Delete Proxy Menu"])
     rows.append(["💲 Set Base Costs", "🔙 Back to Admin"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -966,16 +943,11 @@ def build_country_selection_markup():
     return InlineKeyboardMarkup(buttons)
 
 def build_proxy_selection_markup():
-    p_menus = config_db.get("proxy_menus", {})
-    if not p_menus:
-        return None
-    buttons = []
-    for pm_key, pm_cfg in p_menus.items():
-        pm_lbl = pm_cfg.get("label", pm_key)
-        pm_price = float(pm_cfg.get("price", 5.0))
-        btn_label = f"{pm_lbl} — ${pm_price:.2f} USD"
-        buttons.append([InlineKeyboardButton(btn_label, callback_data=f"buy_proxy_menu_{pm_key}")])
-    return InlineKeyboardMarkup(buttons)
+    proxy_price = float(config_db.get("prices", {}).get("Proxy", 5.0))
+    btn_label = f"🌐 Monthly $5 Proxy — ${proxy_price:.2f} USD"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(btn_label, callback_data="buy_proxy_menu_monthly_5")]
+    ])
 
 # ==========================================
 # Command & Text Message Handlers
@@ -1468,10 +1440,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for ck in get_all_country_keys():
             cfg = get_country_config(ck)
             lines_p.append(f"{cfg.get('label', ck)}: `${prices.get(ck, 0.175):.3f}` (Cost: ${base_costs.get(ck, 0.100):.3f})")
+        proxy_price = float(prices.get("Proxy", 5.0))
         lines_p.append(f"📧 Email: `${prices.get('MailTM', 0.01):.3f}`")
-        for pm_key, pm_cfg in config_db.get("proxy_menus", {}).items():
-            lines_p.append(f"🌐 {pm_cfg.get('label', pm_key)}: `${float(pm_cfg.get('price', 5.0)):.2f}`")
-        lines_p.append("\nSelect an option or manage menus:")
+        lines_p.append(f"🌐 Monthly $5 Proxy: `${proxy_price:.2f}`")
+        lines_p.append("\nSelect an option to change price or manage number menus:")
         await update.message.reply_text(
             "\n".join(lines_p),
             parse_mode="Markdown",
@@ -1578,100 +1550,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Proxy API URL updated.", reply_markup=get_proxy_admin_keyboard())
         return
 
-    if text == "➕ Add Proxy Menu":
-        pending_new_country[user_id] = {}
-        admin_states[user_id] = "NEW_PROXY_MENU_NAME"
-        await update.message.reply_text(
-            "🆕 **Add New Proxy Menu**\n\nEnter the proxy package name (e.g., `10GB Proxy` or `5GB Proxy`):",
-            parse_mode="Markdown",
-            reply_markup=get_cancel_admin_keyboard()
-        )
-        return
 
-    if state == "NEW_PROXY_MENU_NAME":
-        p_title = text.strip()
-        if not p_title:
-            await update.message.reply_text("❌ Name cannot be empty.")
-            return
-        safe_pkey = "proxy_" + re.sub(r'[^A-Za-z0-9_]', '_', p_title.lower())
-        if safe_pkey in config_db.get("proxy_menus", {}):
-            safe_pkey = f"{safe_pkey}_{int(time.time()) % 10000}"
-        p_label = p_title if any(ord(ch) > 127 for ch in p_title) else f"🌐 {p_title}"
-        pending_new_country[user_id] = {"key": safe_pkey, "label": p_label}
-        admin_states[user_id] = "NEW_PROXY_MENU_PRICE"
-        await update.message.reply_text(
-            f"💵 Enter the **Sell Price** in USD for **{p_label}** (e.g., `5` or `9.99`):",
-            parse_mode="Markdown",
-            reply_markup=get_cancel_admin_keyboard()
-        )
-        return
-
-    if state == "NEW_PROXY_MENU_PRICE":
-        try:
-            pm_price = float(text.strip())
-            if pm_price < 0:
-                raise ValueError
-            draft = pending_new_country.pop(user_id, {})
-            pm_key = draft["key"]
-            pm_label = draft["label"]
-            config_db.setdefault("proxy_menus", {})[pm_key] = {
-                "label": pm_label,
-                "price": round(pm_price, 4)
-            }
-            await save_db_async("config", config_db)
-            admin_states.pop(user_id, None)
-            await update.message.reply_text(
-                f"✅ New proxy menu **{pm_label}** (`${pm_price:.2f} USD`) has been added.",
-                parse_mode="Markdown",
-                reply_markup=get_admin_keyboard()
-            )
-        except ValueError:
-            await update.message.reply_text("❌ Please enter a valid price.")
-        return
-
-    if text == "🗑 Delete Proxy Menu":
-        p_menus = config_db.get("proxy_menus", {})
-        if not p_menus:
-            await update.message.reply_text("❌ No proxy menus exist to delete.", reply_markup=get_admin_keyboard())
-            return
-        rows = []
-        row = []
-        for pm_key, pm_cfg in p_menus.items():
-            lbl = pm_cfg.get("label", pm_key)
-            row.append(f"❌ Remove Proxy: {lbl}")
-            if len(row) == 2:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
-        rows.append(["🔙 Back to Admin"])
-        admin_states[user_id] = "DELETE_PROXY_MENU_STATE"
-        await update.message.reply_text(
-            "🗑 **Delete Proxy Menu**\n\nSelect the proxy menu you want to remove:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup(rows, resize_keyboard=True)
-        )
-        return
-
-    if state == "DELETE_PROXY_MENU_STATE":
-        target_pm = None
-        for pm_key, pm_cfg in list(config_db.get("proxy_menus", {}).items()):
-            lbl = pm_cfg.get("label", pm_key)
-            if text == f"❌ Remove Proxy: {lbl}":
-                target_pm = pm_key
-                break
-        if not target_pm:
-            await update.message.reply_text("❌ Invalid selection. Choose a proxy menu from the buttons.")
-            return
-        removed_pm = config_db["proxy_menus"].pop(target_pm, {})
-        await save_db_async("config", config_db)
-        admin_states.pop(user_id, None)
-        await update.message.reply_text(
-            f"✅ Proxy menu **{removed_pm.get('label', target_pm)}** has been deleted.",
-            parse_mode="Markdown",
-            reply_markup=get_admin_keyboard()
-        )
-        return
 
     if text == "📧 Email Settings":
         curr_server = str(config_db.get("email_server", "mail_tm"))
@@ -1889,32 +1768,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✍️ Enter new **Sell Price** for **Email**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
 
-    for _pm_k, _pm_c in config_db.get("proxy_menus", {}).items():
-        _pm_lbl = _pm_c.get("label", _pm_k)
-        if text.startswith(f"🌐 {_pm_lbl} ("):
-            admin_states[user_id] = f"WAITING_PROXY_MENU_PRICE_{_pm_k}"
-            await update.message.reply_text(f"✍️ Enter new **Sell Price** for **{_pm_lbl}**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
-            return
-
-    if state and state.startswith("WAITING_PROXY_MENU_PRICE_"):
-        pm_key = state.replace("WAITING_PROXY_MENU_PRICE_", "", 1)
-        try:
-            new_p = float(text.strip())
-            if new_p < 0:
-                raise ValueError
-            if pm_key in config_db.get("proxy_menus", {}):
-                config_db["proxy_menus"][pm_key]["price"] = round(new_p, 4)
-                lbl = config_db["proxy_menus"][pm_key].get("label", pm_key)
-                await save_db_async("config", config_db)
-                await update.message.reply_text(f"✅ **{lbl}** Price updated to `${new_p:.2f}`.", parse_mode="Markdown", reply_markup=get_admin_keyboard())
-            admin_states.pop(user_id, None)
-        except ValueError:
-            await update.message.reply_text("❌ Invalid price.")
-        return
-
-    if text.startswith("🌐 Proxy"):
+    if text.startswith("🌐 Monthly $5 Proxy") or text.startswith("🌐 Proxy"):
         admin_states[user_id] = "WAITING_PRICE_Proxy"
-        await update.message.reply_text("✍️ Enter new **Sell Price** for **Proxy**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+        await update.message.reply_text("✍️ Enter new **Sell Price** for **Monthly $5 Proxy**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
 
     for _ck in get_all_country_keys():
@@ -1935,6 +1791,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             config_db["prices"][c_key] = round(new_price, 4)
             if c_key in config_db.get("custom_countries", {}):
                 config_db["custom_countries"][c_key]["price"] = round(new_price, 4)
+
             await save_db_async("config", config_db)
             await update.message.reply_text(f"✅ **{c_key}** Price updated to `${new_price:.3f}`.", parse_mode="Markdown", reply_markup=get_admin_keyboard())
             admin_states.pop(user_id, None)
@@ -2332,7 +2189,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             config_db.setdefault("total_deposits", 0.0)
             config_db.setdefault("custom_countries", {})
             config_db.setdefault("country_settings", json.loads(json.dumps(DEFAULT_COUNTRY_SETTINGS)))
-            config_db.setdefault("proxy_menus", {"proxy_5gb": {"label": "🌐 5GB Proxy", "price": 5.0}})
+            config_db.pop("proxy_menus", None)
             mail_tokens_db = load_db("mail_tokens", {})
             data.setdefault("used_names", [])
             data.setdefault("used_numbers", [])
@@ -2693,20 +2550,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action.startswith("buy_proxy_menu_"):
-        pm_key = action.replace("buy_proxy_menu_", "", 1)
-        p_menus = config_db.get("proxy_menus", {})
-        pm_cfg = p_menus.get(pm_key)
-        if not pm_cfg:
-            await query.answer("❌ Proxy package not found.", show_alert=True)
-            return
-
         proxy_list = proxies_db.get("proxies", [])
         if not proxy_list:
             await query.answer("❌ Out of stock! No proxies are currently available.", show_alert=True)
             return
 
-        price = float(pm_cfg.get("price", 5.0))
-        pm_label = pm_cfg.get("label", pm_key)
+        price = float(config_db.get("prices", {}).get("Proxy", 5.0))
+        pm_label = "🌐 Monthly $5 Proxy"
 
         if u_rec.get("balance", 0.0) < price:
             await query.answer(
