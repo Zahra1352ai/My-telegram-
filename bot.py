@@ -1066,7 +1066,8 @@ def get_price_country_keyboard():
         f"🌐 Proxy 2000x (${float(p_prices.get('count_2000', 16.0)):.2f})"
     ])
     rows.append(["➕ Add Number Menu", "🗑 Delete Number Menu"])
-    rows.append(["💲 Set Base Costs", "🔙 Back to Admin"])
+    rows.append(["💲 Set Base Costs", "📈 Profit Statistics"])
+    rows.append(["🔙 Back to Admin"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def get_discount_menu_keyboard():
@@ -2290,6 +2291,72 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid price.")
         return
         
+    if text == "📈 Profit Statistics":
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 5.0})
+        base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
+        total_deposits = float(config_db.get("total_deposits", 0.0))
+
+        lines_profit = [
+            "📈 **COUNTRY & FINANCIAL PROFIT STATISTICS**",
+            "━━━━━━━━━━━━━━━━━━━━"
+        ]
+
+        total_country_sales = 0.0
+        total_country_cost = 0.0
+        total_country_profit = 0.0
+        total_otp_all = 0
+
+        for ck in get_all_country_keys():
+            cfg = get_country_config(ck)
+            c_all = data.get(ck, [])
+            otp_items = [n for n in c_all if n.get("status") == "used" and n.get("has_code", False)]
+            otp_cnt = len(otp_items)
+            total_otp_all += otp_cnt
+
+            unit_sell = float(prices.get(ck, 0.175))
+            unit_cost = float(base_costs.get(ck, 0.100))
+            unit_margin = unit_sell - unit_cost
+
+            c_revenue = sum(float(n.get("paid_price", unit_sell)) for n in otp_items)
+            c_cost = otp_cnt * unit_cost
+            c_profit = c_revenue - c_cost
+
+            total_country_sales += c_revenue
+            total_country_cost += c_cost
+            total_country_profit += c_profit
+
+            lines_profit.append(
+                f"{cfg.get('label', ck)}:\n"
+                f"   ├ 💵 Sell Price: `${unit_sell:.3f}` | Base Cost: `${unit_cost:.3f}`\n"
+                f"   ├ 📊 Unit Margin: `${unit_margin:.3f}`\n"
+                f"   ├ ✅ Sold (OTP): `{otp_cnt}`\n"
+                f"   ├ 💰 Revenue: `${c_revenue:.3f}` | Cost: `${c_cost:.3f}`\n"
+                f"   └ 🟢 **Net Profit:** `${c_profit:.3f} USD`"
+            )
+
+        email_sales = sum(float(h.get("price", 0.0)) for h in history_db if h.get("type") == "email")
+        proxy_sales = sum(float(h.get("price", 0.0)) for h in history_db if h.get("type") == "proxy")
+        all_sales = sum(float(u.get("total_spent", 0.0)) for u in users_db.values())
+        overall_net_profit = all_sales - total_country_cost
+
+        lines_profit.append(
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌍 **Numbers Summary (All Countries):**\n"
+            f"   ├ ✅ Total OTP Sold: `{total_otp_all}`\n"
+            f"   ├ 💵 Numbers Revenue: `${total_country_sales:.3f}`\n"
+            f"   ├ 📉 Numbers Base Cost: `${total_country_cost:.3f}`\n"
+            f"   └ 🟢 **Numbers Net Profit:** `${total_country_profit:.3f} USD`\n\n"
+            f"💰 **Overall Financials:**\n"
+            f"   ├ 🏦 Total Deposits: `${total_deposits:.3f} USD`\n"
+            f"   ├ 📧 Email Sales: `${email_sales:.3f} USD`\n"
+            f"   ├ 🌐 Proxy Sales: `${proxy_sales:.3f} USD`\n"
+            f"   ├ 💳 Total Sales: `${all_sales:.3f} USD`\n"
+            f"   └ 🏆 **Total Net Profit:** `${overall_net_profit:.3f} USD`"
+        )
+
+        await send_long_markdown(update.message, "\n\n".join(lines_profit), reply_markup=get_price_country_keyboard())
+        return
+
     if text == "💲 Set Base Costs":
         admin_states[user_id] = "WAITING_BASE_COST_COUNTRY"
         await update.message.reply_text("💲 Enter country to set base cost (`USA`, `China`, `Canada` or custom key):", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
@@ -2328,20 +2395,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_users = len(users_db)
         total_bal = sum(u.get("balance", 0.0) for u in users_db.values())
         
-        base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
-        total_cost = 0.0
         inv_lines = []
         for ck in get_all_country_keys():
             c_all = data.get(ck, [])
             c_free = len([n for n in c_all if n.get("status") == "free"])
             c_otp = len([n for n in c_all if n.get("status") == "used" and n.get("has_code")])
-            total_cost += c_otp * base_costs.get(ck, 0.100)
             cfg = get_country_config(ck)
             inv_lines.append(f"{cfg.get('label', ck)} Inventory:\n   ├ 🆓 Free: `{c_free}`\n   └ ✅ OTP Received: `{c_otp}`")
 
-        total_deposits = config_db.get("total_deposits", 0.0)
-        total_spent = sum(u.get("total_spent", 0.0) for u in users_db.values())
-        net_profit = total_spent - total_cost
         today_num_cnt = get_total_today_usage_by_type("number")
         today_email_cnt = get_total_today_usage_by_type("email")
         today_proxy_cnt = get_total_today_usage_by_type("proxy")
@@ -2355,11 +2416,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\n\n📅 **Today's Activity (Iran Time):**\n"
             f"   ├ 📱 Numbers Assigned: `{today_num_cnt}`\n"
             f"   ├ 📧 Emails Purchased: `{today_email_cnt}`\n"
-            f"   └ 🌐 Proxies Purchased: `{today_proxy_cnt}`\n"
-            f"\n💰 **Financials:**\n"
-            f"   ├ Total Deposits: `${total_deposits:.3f}`\n"
-            f"   ├ Total Sales: `${total_spent:.3f}`\n"
-            f"   └ **Net Profit:** `${net_profit:.3f} USD`"
+            f"   └ 🌐 Proxies Purchased: `{today_proxy_cnt}`"
         )
         await send_long_markdown(update.message, stats_msg)
 
