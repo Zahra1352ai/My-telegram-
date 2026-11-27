@@ -167,6 +167,24 @@ DEFAULT_COUNTRY_SETTINGS = {
     }
 }
 
+DEFAULT_PROXY_PRICES = {
+    "daily_5": 5.0,
+    "daily_15": 13.5,
+    "daily_30": 24.0,
+    "count_500": 5.0,
+    "count_1000": 9.0,
+    "count_2000": 16.0
+}
+
+PROXY_PLAN_META = {
+    "daily_5": {"category": "daily", "title": "5 Days", "days": 5, "quota": 0},
+    "daily_15": {"category": "daily", "title": "15 Days", "days": 15, "quota": 0},
+    "daily_30": {"category": "daily", "title": "30 Days", "days": 30, "quota": 0},
+    "count_500": {"category": "count", "title": "500 Proxies", "days": 0, "quota": 500},
+    "count_1000": {"category": "count", "title": "1000 Proxies", "days": 0, "quota": 1000},
+    "count_2000": {"category": "count", "title": "2000 Proxies", "days": 0, "quota": 2000},
+}
+
 # Load database tables
 data = load_db("data", {"USA": [], "China": [], "Canada": [], "used_names": [], "used_numbers": [], "canceled": []})
 for _ck in ["USA", "China", "Canada"]:
@@ -208,7 +226,10 @@ if "proxies" not in proxies_db or not isinstance(proxies_db["proxies"], list):
 
 config_db = load_db("config", {
     "active": True,
-    "prices": {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05},
+    "prices": {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 5.0},
+    "proxy_prices": dict(DEFAULT_PROXY_PRICES),
+    "discounts": {},
+    "low_stock_notified": False,
     "base_costs": {"USA": 0.100, "China": 0.120, "Canada": 0.100},
     "usdt_bep20_address": "0xYourDefaultUSDT_BEP20_Wallet_Address_Here",
     "total_deposits": 0.0,
@@ -225,12 +246,17 @@ for _mt_val in mail_tokens_db.values():
     if isinstance(_mt_val, dict) and _mt_val.get("email"):
         used_mail_addresses.add(_mt_val["email"])
 
-config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
+config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 5.0})
 config_db["prices"].setdefault("USA", 0.175)
 config_db["prices"].setdefault("China", 0.195)
 config_db["prices"].setdefault("Canada", 0.175)
 config_db["prices"].setdefault("MailTM", 0.01)
 config_db["prices"].setdefault("Proxy", 5.0)
+config_db.setdefault("proxy_prices", dict(DEFAULT_PROXY_PRICES))
+for _ppk, _ppv in DEFAULT_PROXY_PRICES.items():
+    config_db["proxy_prices"].setdefault(_ppk, _ppv)
+config_db.setdefault("discounts", {})
+config_db.setdefault("low_stock_notified", False)
 config_db.setdefault("email_server", "mail_tm")
 config_db.setdefault("email_token", DEFAULT_VENUS_API_KEY)
 config_db.setdefault("email_api_url", DEFAULT_VENUS_BASE_URL)
@@ -296,6 +322,80 @@ def find_country_by_upload_text(text):
         if cfg.get("upload_label") == text:
             return c_key
     return None
+
+# ==========================================
+# Pricing, Discount & Low-Stock Helpers
+# ==========================================
+def get_discount_percent(discount_key: str) -> float:
+    discounts = config_db.get("discounts", {})
+    if discount_key in discounts:
+        return max(0.0, min(100.0, float(discounts.get(discount_key, 0.0) or 0.0)))
+    if discount_key.startswith("proxy_") and "all_proxies" in discounts:
+        return max(0.0, min(100.0, float(discounts.get("all_proxies", 0.0) or 0.0)))
+    if discount_key.startswith("country_") and "all_numbers" in discounts:
+        return max(0.0, min(100.0, float(discounts.get("all_numbers", 0.0) or 0.0)))
+    return 0.0
+
+def apply_discount(base_price: float, discount_key: str) -> float:
+    pct = get_discount_percent(discount_key)
+    if pct <= 0:
+        return round(float(base_price), 4)
+    final_p = float(base_price) * (1.0 - (pct / 100.0))
+    return round(max(0.0, final_p), 4)
+
+def get_country_effective_price(country_key: str) -> float:
+    base_p = float(config_db.get("prices", {}).get(country_key, 0.175))
+    return apply_discount(base_p, f"country_{country_key}")
+
+def get_email_effective_price() -> float:
+    base_p = float(config_db.get("prices", {}).get("MailTM", 0.01))
+    return apply_discount(base_p, "email_MailTM")
+
+def get_proxy_plan_effective_price(plan_key: str) -> float:
+    base_p = float(config_db.get("proxy_prices", {}).get(plan_key, DEFAULT_PROXY_PRICES.get(plan_key, 5.0)))
+    return apply_discount(base_p, f"proxy_{plan_key}")
+
+def get_total_free_numbers_count() -> int:
+    total_free = 0
+    for ck in get_all_country_keys():
+        total_free += len([
+            n for n in data.get(ck, [])
+            if n.get("status") == "free" and str(n.get("number", "")) not in used_numbers_set
+        ])
+    return total_free
+
+async def check_and_notify_low_stock(bot):
+    """Sends a one-time alert to the admin when total free numbers reach 20 (or drop to <= 20)."""
+    total_free = get_total_free_numbers_count()
+    if total_free > 20:
+        if config_db.get("low_stock_notified", False):
+            config_db["low_stock_notified"] = False
+            await save_db_async("config", config_db)
+        return
+
+    if total_free <= 20 and not config_db.get("low_stock_notified", False):
+        config_db["low_stock_notified"] = True
+        await save_db_async("config", config_db)
+        breakdown_lines = []
+        for ck in get_all_country_keys():
+            cfg = get_country_config(ck)
+            c_free = len([
+                n for n in data.get(ck, [])
+                if n.get("status") == "free" and str(n.get("number", "")) not in used_numbers_set
+            ])
+            breakdown_lines.append(f"• {cfg.get('label', ck)}: `{c_free}`")
+        alert_msg = (
+            f"⚠️ **LOW NUMBER INVENTORY ALERT**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📉 Total available (free) numbers in the bot have reached **`{total_free}`**!\n\n"
+            + "\n".join(breakdown_lines) +
+            f"\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"➕ *Please upload fresh numbers via* **➕ Add Numbers** *in the Admin Panel.*"
+        )
+        try:
+            await bot.send_message(chat_id=ADMIN_ID, text=alert_msg, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Failed to send low stock alert to admin: {e}")
 
 # ==========================================
 # Shared HTTP Client & Safe Telegram Helpers
@@ -559,6 +659,8 @@ def get_user_record(user_id):
         users_db[u_str]["proxy_expires_at"] = 0.0
     if "proxy_subscribed_at" not in users_db[u_str]:
         users_db[u_str]["proxy_subscribed_at"] = 0.0
+    if "proxy_remaining_count" not in users_db[u_str]:
+        users_db[u_str]["proxy_remaining_count"] = 0
     if "purchase_logs" not in users_db[u_str]:
         users_db[u_str]["purchase_logs"] = []
     if "balance_adjustments" not in users_db[u_str]:
@@ -569,7 +671,8 @@ def has_active_proxy_membership(u_rec, now_ts=None):
     if now_ts is None:
         now_ts = time.time()
     exp_ts = float(u_rec.get("proxy_expires_at", 0.0) or 0.0)
-    return exp_ts > now_ts
+    rem_cnt = int(u_rec.get("proxy_remaining_count", 0) or 0)
+    return exp_ts > now_ts or rem_cnt > 0
 
 def get_today_iran_str():
     return datetime.now(IRAN_TZ).strftime('%Y-%m-%d')
@@ -676,7 +779,7 @@ def build_nightly_report():
     iran_tz = timezone(timedelta(hours=3, minutes=30))
     now_str = datetime.now(iran_tz).strftime("%Y-%m-%d %H:%M")
     
-    lines = [f"?? **Nightly 24-Hour Report — {now_str} (Iran Time)**", "━━━━━━━━━━━━━━━━━━"]
+    lines = [f"🌙 **Nightly 24-Hour Report — {now_str} (Iran Time)**", "━━━━━━━━━━━━━━━━━━"]
     
     total_otp = 0
     total_assigned = 0
@@ -806,7 +909,7 @@ async def auto_refund_worker(application: Application):
                             user_id = item.get("user_id")
                             if user_id:
                                 u_rec = get_user_record(user_id)
-                                refund_amount = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
+                                refund_amount = item.get("paid_price", get_country_effective_price(country))
                                 u_rec["balance"] = round(u_rec.get("balance", 0.0) + refund_amount, 4)
                                 
                                 num_str = str(item.get("number", ""))
@@ -889,12 +992,12 @@ def get_main_keyboard(user_id):
 def get_admin_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Add Numbers", "💰 Manage Balance"],
-        ["💵 Set Prices", "🏦 Set USDT Wallet"],
-        ["🌐 Proxy & Email Settings", "📊 Statistics"],
-        ["👥 User Report", "🗑 Delete"],
-        ["📥 Export", "📢 Broadcast"],
-        ["⚙️ System Toggle", "📁 Send Database"],
-        ["🔙 User Menu"]
+        ["💵 Set Prices", "🏷 Manage Discounts"],
+        ["🏦 Set USDT Wallet", "🌐 Proxy & Email Settings"],
+        ["📊 Statistics", "👥 User Report"],
+        ["🗑 Delete", "📥 Export"],
+        ["📢 Broadcast", "⚙️ System Toggle"],
+        ["📁 Send Database", "🔙 User Menu"]
     ], resize_keyboard=True)
 
 def get_services_keyboard():
@@ -936,7 +1039,8 @@ def get_country_upload_keyboard():
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def get_price_country_keyboard():
-    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
+    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 5.0})
+    p_prices = config_db.get("proxy_prices", DEFAULT_PROXY_PRICES)
     rows = []
     row = []
     for c_key in get_all_country_keys():
@@ -949,10 +1053,50 @@ def get_price_country_keyboard():
     if row:
         rows.append(row)
     rows.append([f"📧 Email (${prices.get('MailTM', 0.01):.3f})"])
-    proxy_price = float(prices.get("Proxy", 5.0))
-    rows.append([f"🌐 Monthly Proxy (${proxy_price:.2f})"])
+    rows.append([
+        f"🌐 Proxy 5D (${float(p_prices.get('daily_5', 5.0)):.2f})",
+        f"🌐 Proxy 15D (${float(p_prices.get('daily_15', 13.5)):.2f})"
+    ])
+    rows.append([
+        f"🌐 Proxy 30D (${float(p_prices.get('daily_30', 24.0)):.2f})",
+        f"🌐 Proxy 500x (${float(p_prices.get('count_500', 5.0)):.2f})"
+    ])
+    rows.append([
+        f"🌐 Proxy 1000x (${float(p_prices.get('count_1000', 9.0)):.2f})",
+        f"🌐 Proxy 2000x (${float(p_prices.get('count_2000', 16.0)):.2f})"
+    ])
     rows.append(["➕ Add Number Menu", "🗑 Delete Number Menu"])
     rows.append(["💲 Set Base Costs", "🔙 Back to Admin"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def get_discount_menu_keyboard():
+    rows = [
+        ["🏷 All Numbers Discount", "🏷 Email Discount"],
+        ["🏷 All Proxies Discount", "🗑 Clear All Discounts"]
+    ]
+    row = []
+    for c_key in get_all_country_keys():
+        cfg = get_country_config(c_key)
+        pct = get_discount_percent(f"country_{c_key}")
+        row.append(f"🏷 {cfg.get('label', c_key)} ({pct:g}%)")
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        f"🏷 Proxy 5D ({get_discount_percent('proxy_daily_5'):g}%)",
+        f"🏷 Proxy 15D ({get_discount_percent('proxy_daily_15'):g}%)"
+    ])
+    rows.append([
+        f"🏷 Proxy 30D ({get_discount_percent('proxy_daily_30'):g}%)",
+        f"🏷 Proxy 500x ({get_discount_percent('proxy_count_500'):g}%)"
+    ])
+    rows.append([
+        f"🏷 Proxy 1000x ({get_discount_percent('proxy_count_1000'):g}%)",
+        f"🏷 Proxy 2000x ({get_discount_percent('proxy_count_2000'):g}%)"
+    ])
+    rows.append(["🔙 Back to Admin"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def get_prefix_choice_keyboard():
@@ -986,28 +1130,69 @@ def get_cancel_user_keyboard():
     return ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
 
 # ==========================================
-# Inline Keyboard Builder
+# Inline Keyboard Builders
 # ==========================================
 def build_country_selection_markup():
-    prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
     buttons = []
     for c_key in get_all_country_keys():
         free_cnt = len([n for n in data.get(c_key, []) if n.get("status") == "free" and str(n.get("number", "")) not in used_numbers_set])
         if free_cnt > 0:
             cfg = get_country_config(c_key)
-            p_val = prices.get(c_key, 0.175)
-            btn_label = f"{cfg.get('btn_text', cfg.get('label', c_key))} USD {p_val:.3f}"
+            base_p = float(config_db.get("prices", {}).get(c_key, 0.175))
+            eff_p = get_country_effective_price(c_key)
+            disc_pct = get_discount_percent(f"country_{c_key}")
+            if disc_pct > 0 and eff_p < base_p:
+                btn_label = f"{cfg.get('btn_text', cfg.get('label', c_key))} USD {eff_p:.3f} (-{disc_pct:g}%)"
+            else:
+                btn_label = f"{cfg.get('btn_text', cfg.get('label', c_key))} USD {eff_p:.3f}"
             buttons.append([InlineKeyboardButton(btn_label, callback_data=f"buy_country_{c_key}")])
     if not buttons:
         return None
     return InlineKeyboardMarkup(buttons)
 
-def build_proxy_selection_markup():
-    proxy_price = float(config_db.get("prices", {}).get("Proxy", 5.0))
-    btn_label = f"🌐 Monthly Proxy — ${proxy_price:.2f} USD"
+def build_proxy_main_inline_markup():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(btn_label, callback_data="buy_proxy_menu_monthly_5")]
+        [
+            InlineKeyboardButton("📅 Daily", callback_data="proxy_cat_daily"),
+            InlineKeyboardButton("🔢 Quantity", callback_data="proxy_cat_count")
+        ]
     ])
+
+def build_proxy_daily_inline_markup():
+    rows = []
+    for plan_key, label_prefix in [
+        ("daily_5", "📅 5 Days"),
+        ("daily_15", "📅 15 Days"),
+        ("daily_30", "📅 30 Days")
+    ]:
+        base_p = float(config_db.get("proxy_prices", {}).get(plan_key, DEFAULT_PROXY_PRICES[plan_key]))
+        eff_p = get_proxy_plan_effective_price(plan_key)
+        disc_pct = get_discount_percent(f"proxy_{plan_key}")
+        if disc_pct > 0 and eff_p < base_p:
+            btn_text = f"{label_prefix} — ${eff_p:g} (-{disc_pct:g}%)"
+        else:
+            btn_text = f"{label_prefix} — ${eff_p:g}"
+        rows.append([InlineKeyboardButton(btn_text, callback_data=f"buy_proxy_plan_{plan_key}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="proxy_cat_back")])
+    return InlineKeyboardMarkup(rows)
+
+def build_proxy_count_inline_markup():
+    rows = []
+    for plan_key, label_prefix in [
+        ("count_500", "🔢 500 Proxies"),
+        ("count_1000", "🔢 1000 Proxies"),
+        ("count_2000", "🔢 2000 Proxies")
+    ]:
+        base_p = float(config_db.get("proxy_prices", {}).get(plan_key, DEFAULT_PROXY_PRICES[plan_key]))
+        eff_p = get_proxy_plan_effective_price(plan_key)
+        disc_pct = get_discount_percent(f"proxy_{plan_key}")
+        if disc_pct > 0 and eff_p < base_p:
+            btn_text = f"{label_prefix} — ${eff_p:g} (-{disc_pct:g}%)"
+        else:
+            btn_text = f"{label_prefix} — ${eff_p:g}"
+        rows.append([InlineKeyboardButton(btn_text, callback_data=f"buy_proxy_plan_{plan_key}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="proxy_cat_back")])
+    return InlineKeyboardMarkup(rows)
 
 # ==========================================
 # Command & Text Message Handlers
@@ -1098,8 +1283,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Buy Email Flow (Venus Server 1, Venus Server 2 & Mail.tm)
     # ==========================================
     if text in ["📧 Buy Email", "📧 Mail.tm Email"]:
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
-        price = prices.get("MailTM", 0.01)
+        price = get_email_effective_price()
 
         if u_rec.get("balance", 0.0) < price:
             await update.message.reply_text(
@@ -1159,7 +1343,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Failed to generate an email address right now. No balance was deducted. Please try again.")
             return
 
-        # Venus Server 1 or Venus Server 2 (unified UI & 2-code flow)
+        # Venus Server 1 or Venus Server 2
         api_key = config_db.get("email_token", DEFAULT_VENUS_API_KEY)
         base_url = config_db.get("email_api_url", DEFAULT_VENUS_BASE_URL)
         if not base_url.endswith("/"):
@@ -1229,13 +1413,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================================
-    # Buy Proxy Flow
+    # Buy Proxy Flow (Daily & Quantity Inline Menus)
     # ==========================================
     if text == "🌐 Buy Proxy":
         proxy_list = proxies_db.get("proxies", [])
-        markup = build_proxy_selection_markup()
-
-        if not proxy_list or not markup:
+        if not proxy_list:
             await update.message.reply_text(
                 "❌ **Out of Stock!**\n\nNo proxies are currently available. Please check back later.",
                 parse_mode="Markdown"
@@ -1243,13 +1425,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         proxy_intro = (
-            f"🌐 **Monthly Proxy Membership**\n"
+            f"🌐 **High-Speed Dedicated Proxy Store**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📅 *Valid for 30 days (1 month) from purchase.*\n"
-            f"ℹ️ *Active members automatically receive a proxy below their assigned numbers until the 30-day membership expires.*\n\n"
-            f"👇 **Subscribe below:**"
+            f"🚀 *Fast, private, and reliable proxies delivered automatically with your numbers.*\n"
+            f"⚡ *Choose between time-based* **Daily** *plans or usage-based* **Quantity** *packages below:*"
         )
-        await update.message.reply_text(proxy_intro, parse_mode="Markdown", reply_markup=markup)
+        await update.message.reply_text(
+            proxy_intro,
+            parse_mode="Markdown",
+            reply_markup=build_proxy_main_inline_markup()
+        )
         return
 
     # ==========================================
@@ -1587,22 +1772,143 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid number format. Use e.g. `5` or `-4`.", parse_mode="Markdown")
         return
 
+    # ==========================================
+    # Set Prices (Numbers, Email, & All 6 Proxy Plans)
+    # ==========================================
     if text == "💵 Set Prices":
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 0.05})
+        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 5.0})
+        p_prices = config_db.get("proxy_prices", DEFAULT_PROXY_PRICES)
         base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
-        lines_p = ["💵 **Current Prices:**"]
+        lines_p = ["💵 **Current Base Prices:**"]
         for ck in get_all_country_keys():
             cfg = get_country_config(ck)
             lines_p.append(f"{cfg.get('label', ck)}: `${prices.get(ck, 0.175):.3f}` (Cost: ${base_costs.get(ck, 0.100):.3f})")
-        proxy_price = float(prices.get("Proxy", 5.0))
         lines_p.append(f"📧 Email: `${prices.get('MailTM', 0.01):.3f}`")
-        lines_p.append(f"🌐 Monthly Proxy: `${proxy_price:.2f}`")
+        lines_p.append("\n🌐 **Proxy Plans:**")
+        lines_p.append(f"   ├ 📅 5 Days: `${float(p_prices.get('daily_5', 5.0)):.2f}`")
+        lines_p.append(f"   ├ 📅 15 Days: `${float(p_prices.get('daily_15', 13.5)):.2f}`")
+        lines_p.append(f"   ├ 📅 30 Days: `${float(p_prices.get('daily_30', 24.0)):.2f}`")
+        lines_p.append(f"   ├ 🔢 500 Proxies: `${float(p_prices.get('count_500', 5.0)):.2f}`")
+        lines_p.append(f"   ├ 🔢 1000 Proxies: `${float(p_prices.get('count_1000', 9.0)):.2f}`")
+        lines_p.append(f"   └ 🔢 2000 Proxies: `${float(p_prices.get('count_2000', 16.0)):.2f}`")
         lines_p.append("\nSelect an option to change price or manage number menus:")
         await update.message.reply_text(
             "\n".join(lines_p),
             parse_mode="Markdown",
             reply_markup=get_price_country_keyboard()
         )
+        return
+
+    # ==========================================
+    # Manage Discounts (Numbers, Email, Proxies)
+    # ==========================================
+    if text == "🏷 Manage Discounts":
+        admin_states.pop(user_id, None)
+        discounts = config_db.get("discounts", {})
+        active_lines = []
+        for dk, dv in discounts.items():
+            if float(dv or 0) > 0:
+                active_lines.append(f"• `{dk}`: **{float(dv):g}% OFF**")
+        summary_block = "\n".join(active_lines) if active_lines else "• *No active discounts right now.*"
+        await update.message.reply_text(
+            f"🏷 **Discount Management**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"**Active Discounts:**\n{summary_block}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Select any menu or category below to apply or remove a percentage discount (0–100%):",
+            parse_mode="Markdown",
+            reply_markup=get_discount_menu_keyboard()
+        )
+        return
+
+    if text == "🗑 Clear All Discounts":
+        config_db["discounts"] = {}
+        await save_db_async("config", config_db)
+        await update.message.reply_text(
+            "✅ All discounts have been cleared.",
+            reply_markup=get_discount_menu_keyboard()
+        )
+        return
+
+    if text == "🏷 All Numbers Discount":
+        admin_states[user_id] = "WAITING_DISC_all_numbers"
+        curr = get_discount_percent("all_numbers")
+        await update.message.reply_text(
+            f"🏷 **All Numbers Discount** (Current: `{curr:g}%`)\n\nEnter discount percentage (`0` to remove, e.g. `15` for 15% OFF):",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    if text == "🏷 Email Discount":
+        admin_states[user_id] = "WAITING_DISC_email_MailTM"
+        curr = get_discount_percent("email_MailTM")
+        await update.message.reply_text(
+            f"🏷 **Email Discount** (Current: `{curr:g}%`)\n\nEnter discount percentage (`0` to remove, e.g. `20` for 20% OFF):",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    if text == "🏷 All Proxies Discount":
+        admin_states[user_id] = "WAITING_DISC_all_proxies"
+        curr = get_discount_percent("all_proxies")
+        await update.message.reply_text(
+            f"🏷 **All Proxies Discount** (Current: `{curr:g}%`)\n\nEnter discount percentage (`0` to remove, e.g. `10` for 10% OFF):",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_admin_keyboard()
+        )
+        return
+
+    proxy_disc_map = {
+        "🏷 Proxy 5D": ("proxy_daily_5", "Proxy 5 Days"),
+        "🏷 Proxy 15D": ("proxy_daily_15", "Proxy 15 Days"),
+        "🏷 Proxy 30D": ("proxy_daily_30", "Proxy 30 Days"),
+        "🏷 Proxy 500x": ("proxy_count_500", "Proxy 500 Count"),
+        "🏷 Proxy 1000x": ("proxy_count_1000", "Proxy 1000 Count"),
+        "🏷 Proxy 2000x": ("proxy_count_2000", "Proxy 2000 Count"),
+    }
+    for p_prefix, (d_key, d_title) in proxy_disc_map.items():
+        if text.startswith(p_prefix):
+            admin_states[user_id] = f"WAITING_DISC_{d_key}"
+            curr = get_discount_percent(d_key)
+            await update.message.reply_text(
+                f"🏷 **{d_title} Discount** (Current: `{curr:g}%`)\n\nEnter discount percentage (`0` to remove, e.g. `15` for 15% OFF):",
+                parse_mode="Markdown",
+                reply_markup=get_cancel_admin_keyboard()
+            )
+            return
+
+    for _ck in get_all_country_keys():
+        _cfg = get_country_config(_ck)
+        if text.startswith(f"🏷 {_cfg.get('label', _ck)} ("):
+            admin_states[user_id] = f"WAITING_DISC_country_{_ck}"
+            curr = get_discount_percent(f"country_{_ck}")
+            await update.message.reply_text(
+                f"🏷 **{_cfg.get('label', _ck)} Discount** (Current: `{curr:g}%`)\n\nEnter discount percentage (`0` to remove, e.g. `10` for 10% OFF):",
+                parse_mode="Markdown",
+                reply_markup=get_cancel_admin_keyboard()
+            )
+            return
+
+    if state and state.startswith("WAITING_DISC_"):
+        disc_key = state.replace("WAITING_DISC_", "", 1)
+        try:
+            pct = float(text.strip().replace("%", ""))
+            if pct < 0 or pct > 100:
+                raise ValueError
+            config_db.setdefault("discounts", {})
+            if pct == 0:
+                config_db["discounts"].pop(disc_key, None)
+                msg_res = f"✅ Discount removed for `{disc_key}`."
+            else:
+                config_db["discounts"][disc_key] = round(pct, 2)
+                msg_res = f"✅ Discount of **`{pct:g}% OFF`** applied to `{disc_key}`."
+            await save_db_async("config", config_db)
+            admin_states.pop(user_id, None)
+            await update.message.reply_text(msg_res, parse_mode="Markdown", reply_markup=get_discount_menu_keyboard())
+        except ValueError:
+            await update.message.reply_text("❌ Invalid percentage. Enter a number between `0` and `100`.", parse_mode="Markdown")
         return
 
     # ==========================================
@@ -1619,11 +1925,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "🌐 Proxy Settings":
         total_p = len(proxies_db.get("proxies", []))
-        p_price = config_db.get("prices", {}).get("Proxy", 0.05)
+        p_prices = config_db.get("proxy_prices", DEFAULT_PROXY_PRICES)
         await update.message.reply_text(
             f"🌐 **Proxy Management**\n\n"
             f"📦 **Stored Proxies:** `{total_p}`\n"
-            f"💵 **Current Price:** `${p_price:.3f} USD`",
+            f"💵 **Daily Plans:** 5D `${p_prices.get('daily_5', 5.0):g}` | 15D `${p_prices.get('daily_15', 13.5):g}` | 30D `${p_prices.get('daily_30', 24.0):g}`\n"
+            f"🔢 **Quantity Plans:** 500x `${p_prices.get('count_500', 5.0):g}` | 1000x `${p_prices.get('count_1000', 9.0):g}` | 2000x `${p_prices.get('count_2000', 16.0):g}`",
             parse_mode="Markdown",
             reply_markup=get_proxy_admin_keyboard()
         )
@@ -1703,8 +2010,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_states.pop(user_id, None)
         await update.message.reply_text("✅ Proxy API URL updated.", reply_markup=get_proxy_admin_keyboard())
         return
-
-
 
     if text == "📧 Email Settings":
         curr_server = str(config_db.get("email_server", "mail_tm"))
@@ -1922,9 +2227,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✍️ Enter new **Sell Price** for **Email**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
         return
 
-    if text.startswith("🌐 Monthly Proxy") or text.startswith("🌐 Proxy"):
-        admin_states[user_id] = "WAITING_PRICE_Proxy"
-        await update.message.reply_text("✍️ Enter new **Sell Price** for **Monthly Proxy**:", parse_mode="Markdown", reply_markup=get_cancel_admin_keyboard())
+    proxy_price_btn_map = {
+        "🌐 Proxy 5D": ("daily_5", "Proxy 5 Days"),
+        "🌐 Proxy 15D": ("daily_15", "Proxy 15 Days"),
+        "🌐 Proxy 30D": ("daily_30", "Proxy 30 Days"),
+        "🌐 Proxy 500x": ("count_500", "Proxy 500 Count"),
+        "🌐 Proxy 1000x": ("count_1000", "Proxy 1000 Count"),
+        "🌐 Proxy 2000x": ("count_2000", "Proxy 2000 Count"),
+    }
+    for p_btn_prefix, (p_plan_key, p_plan_title) in proxy_price_btn_map.items():
+        if text.startswith(p_btn_prefix):
+            admin_states[user_id] = f"WAITING_PROXY_PLAN_PRICE_{p_plan_key}"
+            await update.message.reply_text(
+                f"✍️ Enter new **Sell Price** in USD for **{p_plan_title}**:",
+                parse_mode="Markdown",
+                reply_markup=get_cancel_admin_keyboard()
+            )
+            return
+
+    if state and state.startswith("WAITING_PROXY_PLAN_PRICE_"):
+        plan_key = state.replace("WAITING_PROXY_PLAN_PRICE_", "", 1)
+        try:
+            new_price = float(text.strip())
+            if new_price < 0:
+                raise ValueError
+            config_db.setdefault("proxy_prices", dict(DEFAULT_PROXY_PRICES))[plan_key] = round(new_price, 4)
+            await save_db_async("config", config_db)
+            title = PROXY_PLAN_META.get(plan_key, {}).get("title", plan_key)
+            await update.message.reply_text(
+                f"✅ **Proxy ({title})** Price updated to `${new_price:g}`.",
+                parse_mode="Markdown",
+                reply_markup=get_price_country_keyboard()
+            )
+            admin_states.pop(user_id, None)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid price.")
         return
 
     for _ck in get_all_country_keys():
@@ -1984,6 +2321,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid number.")
         return
 
+    # ==========================================
+    # Statistics (Complete Country & Bot Number Breakdown in English)
+    # ==========================================
     if text == "📊 Statistics":
         total_users = len(users_db)
         total_bal = sum(u.get("balance", 0.0) for u in users_db.values())
@@ -2023,19 +2363,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await send_long_markdown(update.message, stats_msg)
 
-        country_summary_lines = ["📋 **COUNTRY NUMBER BREAKDOWN**", "━━━━━━━━━━━━━━━━━━"]
+        country_summary_lines = ["🔢 **BOT NUMBER STATISTICS**", "━━━━━━━━━━━━━━━━━━"]
+        grand_total_all = 0
+        grand_received_all = 0
+        grand_otp_all = 0
+        grand_nocode_all = 0
+        grand_free_all = 0
+
         for ck in get_all_country_keys():
             cfg = get_country_config(ck)
             c_all = data.get(ck, [])
+            c_total = len(c_all)
             c_avail = len([n for n in c_all if n.get("status") == "free"])
             c_otp = len([n for n in c_all if n.get("status") == "used" and n.get("has_code", False)])
-            c_nocode_list = len([n for n in c_all if n.get("status") in ["nocode", "canceled"] or (n.get("status") == "used" and not n.get("has_code", False))])
+            c_nocode_list = len([
+                n for n in c_all
+                if n.get("status") in ["nocode", "canceled"] or (n.get("status") == "used" and not n.get("has_code", False))
+            ])
+            c_received = c_otp + c_nocode_list
+
+            grand_total_all += c_total
+            grand_received_all += c_received
+            grand_otp_all += c_otp
+            grand_nocode_all += c_nocode_list
+            grand_free_all += c_avail
+
             country_summary_lines.append(
-                f"{cfg.get('label', ck)} **{ck}:**\n"
-                f"   ├ 🆓 Available: `{c_avail}`\n"
-                f"   ├ ✅ OTP Received: `{c_otp}`\n"
-                f"   └ ❌ No OTP / Canceled: `{c_nocode_list}`"
+                f"{cfg.get('label', ck)}:\n"
+                f"   🔹 Total Numbers: `{c_total}`\n"
+                f"   🔸 Assigned Numbers: `{c_received}`\n"
+                f"      ├ ✅ OTP Received: `{c_otp}`\n"
+                f"      └ ⏳ No OTP / Canceled: `{c_nocode_list}`\n"
+                f"   🆓 Available (Unassigned): `{c_avail}`"
             )
+
+        country_summary_lines.append(
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📊 **OVERALL TOTAL (ALL COUNTRIES):**\n"
+            f"   🔹 Total Numbers: `{grand_total_all}`\n"
+            f"   🔸 Assigned Numbers: `{grand_received_all}`\n"
+            f"      ├ ✅ OTP Received: `{grand_otp_all}`\n"
+            f"      └ ⏳ No OTP / Canceled: `{grand_nocode_all}`\n"
+            f"   🆓 Available (Unassigned): `{grand_free_all}`"
+        )
         await send_long_markdown(update.message, "\n\n".join(country_summary_lines))
 
         report = build_nightly_report()
@@ -2141,6 +2511,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["canceled"] = []
             data["used_numbers"] = list(used_numbers_set)
             await save_db_async("data", data)
+            await check_and_notify_low_stock(context.bot)
             await update.message.reply_text(
                 f"✅ Deleted `{deleted_count}` OTP-received numbers and restored `{released_count}` canceled/no-OTP numbers back to available stock.",
                 parse_mode="Markdown",
@@ -2155,6 +2526,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             used_numbers_set.clear()
             data["used_numbers"] = []
             await save_db_async("data", data)
+            await check_and_notify_low_stock(context.bot)
             await update.message.reply_text("✅ All numbers cleared.", reply_markup=get_admin_keyboard())
             admin_states.pop(user_id, None)
         return
@@ -2288,7 +2660,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != ADMIN_ID:
         return
 
-    global data, users_db, config_db, mail_tokens_db, proxies_db, history_db
+    global data, users_db, config_db, mail_tokens_db, proxies_db, history_db, invoices_db
     state = admin_states.get(user_id)
     doc_name = update.message.document.file_name
 
@@ -2327,18 +2699,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users_db = load_db("users", {})
             config_db = load_db("config", {
                 "active": True,
-                "prices": {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01},
+                "prices": {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 5.0},
+                "proxy_prices": dict(DEFAULT_PROXY_PRICES),
+                "discounts": {},
+                "low_stock_notified": False,
                 "base_costs": {"USA": 0.100, "China": 0.120, "Canada": 0.100},
                 "usdt_bep20_address": "0xYourDefaultUSDT_BEP20_Wallet_Address_Here",
                 "total_deposits": 0.0,
                 "country_settings": json.loads(json.dumps(DEFAULT_COUNTRY_SETTINGS)),
                 "custom_countries": {}
             })
-            config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
+            config_db.setdefault("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 5.0})
             config_db["prices"].setdefault("USA", 0.175)
             config_db["prices"].setdefault("China", 0.195)
             config_db["prices"].setdefault("Canada", 0.175)
             config_db["prices"].setdefault("MailTM", 0.01)
+            config_db.setdefault("proxy_prices", dict(DEFAULT_PROXY_PRICES))
+            for _ppk, _ppv in DEFAULT_PROXY_PRICES.items():
+                config_db["proxy_prices"].setdefault(_ppk, _ppv)
+            config_db.setdefault("discounts", {})
+            config_db.setdefault("low_stock_notified", False)
             config_db.setdefault("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
             config_db.setdefault("usdt_bep20_address", "0xYourDefaultUSDT_BEP20_Wallet_Address_Here")
             config_db.setdefault("total_deposits", 0.0)
@@ -2361,6 +2741,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if isinstance(_mt_v, dict) and _mt_v.get("email"):
                     used_mail_addresses.add(_mt_v["email"])
             await save_all_dbs_async()
+            await check_and_notify_low_stock(context.bot)
             prices = config_db["prices"]
             wallet = config_db["usdt_bep20_address"]
             stock_summary = " | ".join([f"{ck}: `{len([n for n in data.get(ck, []) if n.get('status') == 'free'])}`" for ck in get_all_country_keys()])
@@ -2419,6 +2800,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 valid_count += 1
                 
         await save_db_async("data", data)
+        await check_and_notify_low_stock(context.bot)
         os.remove(file_path)
         dup_note = f" (Skipped duplicates: `{skipped_dup}`)" if skipped_dup else ""
         await status_msg.edit_text(f"✅ File Processed! Added: `{valid_count}` numbers.{dup_note}", parse_mode="Markdown")
@@ -2742,28 +3124,65 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Your recent orders:\n\n{orders_text}", show_alert=True)
         return
 
-    if action.startswith("buy_proxy_menu_"):
+    # ==========================================
+    # Proxy Category Navigation & Plan Purchase Callbacks
+    # ==========================================
+    if action == "proxy_cat_back":
+        proxy_intro = (
+            f"🌐 **High-Speed Dedicated Proxy Store**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🚀 *Fast, private, and reliable proxies delivered automatically with your numbers.*\n"
+            f"⚡ *Choose between time-based* **Daily** *plans or usage-based* **Quantity** *packages below:*"
+        )
+        await safe_edit_message_text(query, proxy_intro, parse_mode="Markdown", reply_markup=build_proxy_main_inline_markup())
+        await query.answer()
+        return
+
+    if action == "proxy_cat_daily":
+        daily_msg = (
+            f"📅 **Daily Proxy Subscriptions**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"♾️ *Enjoy unlimited proxy attachments on every number you purchase during your active validity period.*\n"
+            f"👇 *Select your preferred duration below:*"
+        )
+        await safe_edit_message_text(query, daily_msg, parse_mode="Markdown", reply_markup=build_proxy_daily_inline_markup())
+        await query.answer()
+        return
+
+    if action == "proxy_cat_count":
+        count_msg = (
+            f"🔢 **Quantity Proxy Packages**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 *Pay only for the exact number of proxy deliveries you need — no expiration timer!*\n"
+            f"👇 *Select your proxy package size below:*"
+        )
+        await safe_edit_message_text(query, count_msg, parse_mode="Markdown", reply_markup=build_proxy_count_inline_markup())
+        await query.answer()
+        return
+
+    if action.startswith("buy_proxy_plan_"):
+        plan_key = action.replace("buy_proxy_plan_", "", 1)
+        meta = PROXY_PLAN_META.get(plan_key)
+        if not meta:
+            await query.answer("❌ Invalid proxy plan.", show_alert=True)
+            return
+
         proxy_list = proxies_db.get("proxies", [])
         if not proxy_list:
             await query.answer("❌ Out of stock! No proxies are currently available.", show_alert=True)
             return
 
-        price = float(config_db.get("prices", {}).get("Proxy", 5.0))
-        pm_label = "🌐 Monthly Proxy"
+        price = get_proxy_plan_effective_price(plan_key)
+        pm_label = f"🌐 Proxy ({meta['title']})"
 
         if u_rec.get("balance", 0.0) < price:
             await query.answer(
-                f"❌ Insufficient balance!\nPrice: ${price:.2f} USD\nYour Balance: ${u_rec.get('balance', 0.0):.3f} USD",
+                f"❌ Insufficient balance!\nPrice: ${price:g} USD\nYour Balance: ${u_rec.get('balance', 0.0):.3f} USD",
                 show_alert=True
             )
             return
 
         now_ts = time.time()
-        thirty_days_sec = 30 * 24 * 3600
-        prev_exp = float(u_rec.get("proxy_expires_at", 0.0) or 0.0)
-        base_ts = prev_exp if prev_exp > now_ts else now_ts
-        new_exp_ts = base_ts + thirty_days_sec
-
         if not str(u_rec.get("active_proxy", "")).strip():
             last_idx = u_rec.get("last_proxy_idx", -1)
             next_idx = (last_idx + 1) % len(proxy_list)
@@ -2772,32 +3191,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         u_rec["active_proxy_plan"] = pm_label
         u_rec["proxy_subscribed_at"] = now_ts
-        u_rec["proxy_expires_at"] = new_exp_ts
         u_rec["balance"] = round(u_rec.get("balance", 0.0) - price, 4)
         u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
         u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + price, 4)
-        await log_usage_action(user_id, "proxy", detail=u_rec.get("active_proxy", ""), price=price, extra={"plan": pm_label, "expires_at": new_exp_ts})
 
-        exp_str = datetime.fromtimestamp(new_exp_ts, IRAN_TZ).strftime("%Y-%m-%d %H:%M")
-        confirm_msg = (
-            f"✅ **MONTHLY PROXY MEMBERSHIP ACTIVATED**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 **Plan:** {pm_label} (30 Days)\n"
-            f"💵 **Price:** `${price:.2f} USD`\n"
-            f"💰 **Remaining Balance:** `${u_rec['balance']:.3f} USD`\n"
-            f"📅 **Valid Until:** `{exp_str}` (Iran Time)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"ℹ️ *Your proxy will be delivered automatically below your assigned numbers while your membership is active.*"
-        )
+        if meta["category"] == "daily":
+            add_sec = int(meta["days"]) * 24 * 3600
+            prev_exp = float(u_rec.get("proxy_expires_at", 0.0) or 0.0)
+            base_ts = prev_exp if prev_exp > now_ts else now_ts
+            new_exp_ts = base_ts + add_sec
+            u_rec["proxy_expires_at"] = new_exp_ts
+            exp_str = datetime.fromtimestamp(new_exp_ts, IRAN_TZ).strftime("%Y-%m-%d %H:%M")
+            await log_usage_action(user_id, "proxy", detail=u_rec.get("active_proxy", ""), price=price, extra={"plan": pm_label, "expires_at": new_exp_ts})
+            confirm_msg = (
+                f"✅ **DAILY PROXY PLAN ACTIVATED**\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 **Plan:** {meta['title']} Unlimited\n"
+                f"💵 **Price:** `${price:g} USD`\n"
+                f"💰 **Remaining Balance:** `${u_rec['balance']:.3f} USD`\n"
+                f"📅 **Valid Until:** `{exp_str}` (Iran Time)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"ℹ️ *Your proxy will be delivered automatically below your assigned numbers while your plan is active.*"
+            )
+        else:
+            add_quota = int(meta["quota"])
+            new_quota = int(u_rec.get("proxy_remaining_count", 0) or 0) + add_quota
+            u_rec["proxy_remaining_count"] = new_quota
+            await log_usage_action(user_id, "proxy", detail=u_rec.get("active_proxy", ""), price=price, extra={"plan": pm_label, "quota_added": add_quota})
+            confirm_msg = (
+                f"✅ **QUANTITY PROXY PACKAGE ACTIVATED**\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 **Package:** {meta['title']}\n"
+                f"💵 **Price:** `${price:g} USD`\n"
+                f"💰 **Remaining Balance:** `${u_rec['balance']:.3f} USD`\n"
+                f"🔢 **Remaining Proxy Deliveries:** `{new_quota}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"ℹ️ *One proxy delivery will be used automatically each time you purchase a number.*"
+            )
+
         await safe_edit_message_text(query, confirm_msg, parse_mode="Markdown")
-        await query.answer("✅ Monthly proxy activated!")
+        await query.answer("✅ Proxy package activated!")
         return
 
+    # ==========================================
+    # Buy Number Callback
+    # ==========================================
     if action.startswith("buy_country_") or action.startswith("buy_another_"):
         is_buy_another = action.startswith("buy_another_")
         country = action.replace("buy_another_", "") if is_buy_another else action.replace("buy_country_", "")
-        prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01})
-        price = prices.get(country, 0.175)
+        price = get_country_effective_price(country)
         
         if u_rec.get("balance", 0.0) < price:
             await query.answer(f"❌ Insufficient balance!\nPrice: ${price:.3f} USD\nYour Balance: ${u_rec.get('balance', 0.0):.3f} USD", show_alert=True)
@@ -2832,6 +3274,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_db_async("config", config_db)
         await save_db_async("data", data)
 
+        # Send one-time low stock alert to admin when total free numbers reach 20
+        await check_and_notify_low_stock(context.bot)
+
         flag = get_country_config(country).get("label", country)
         now_ts = time.time()
         proxy_footer = ""
@@ -2844,7 +3289,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_proxy = proxy_list[next_idx]
                 u_rec["last_proxy_idx"] = next_idx
                 u_rec["active_proxy"] = user_proxy
-                await save_db_async("users", users_db)
+            if float(u_rec.get("proxy_expires_at", 0.0) or 0.0) <= now_ts and int(u_rec.get("proxy_remaining_count", 0) or 0) > 0:
+                u_rec["proxy_remaining_count"] = max(0, int(u_rec.get("proxy_remaining_count", 0)) - 1)
+            await save_db_async("users", users_db)
             if user_proxy:
                 proxy_footer = f"\n\n🌐 **Proxy (Tap to copy):**\n`{user_proxy}`"
         
@@ -2894,7 +3341,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Cannot cancel, OTP already received.", show_alert=True)
             return
 
-        refund_amount = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
+        refund_amount = item.get("paid_price", get_country_effective_price(country))
         u_rec["balance"] = round(u_rec.get("balance", 0.0) + refund_amount, 4)
         u_rec["canceled_count"] = u_rec.get("canceled_count", 0) + 1
         await save_db_async("users", users_db)
@@ -2957,7 +3404,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not item.get("has_code", False):
                     item["has_code"] = True
                     item["code_received_at"] = time.time()
-                    paid = item.get("paid_price", config_db.get("prices", {}).get(country, 0.175))
+                    paid = item.get("paid_price", get_country_effective_price(country))
                     u_rec["total_purchased"] = u_rec.get("total_purchased", 0) + 1
                     u_rec["total_spent"] = round(u_rec.get("total_spent", 0.0) + paid, 4)
                     await save_db_async("data", data)
