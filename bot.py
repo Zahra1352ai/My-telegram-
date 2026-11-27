@@ -790,11 +790,11 @@ def build_user_report():
     return "\n".join(lines)
 
 # ==========================================
-# Background Auto-Refund Worker (15-minute timeout)
+# Background Auto-Refund Worker (10-minute timeout)
 # ==========================================
 async def auto_refund_worker(application: Application):
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(15)
         try:
             current_time = time.time()
             updated = False
@@ -802,7 +802,7 @@ async def auto_refund_worker(application: Application):
                 for item in data.get(country, []):
                     if item.get("status") == "used" and not item.get("has_code", False):
                         assigned_time = item.get("assigned_at", 0)
-                        if assigned_time > 0 and (current_time - assigned_time) >= 900: # 15 Mins
+                        if assigned_time > 0 and (current_time - assigned_time) >= 600: # 10 Mins
                             user_id = item.get("user_id")
                             if user_id:
                                 u_rec = get_user_record(user_id)
@@ -819,24 +819,52 @@ async def auto_refund_worker(application: Application):
                                     "number": num_str,
                                     "link": item.get("link", ""),
                                     "user_id": user_id,
-                                    "reason": "auto_refund_15m",
+                                    "reason": "auto_refund_10m",
                                     "ts": current_time
                                 })
                                 item["status"] = "nocode"
-                                item["cancel_reason"] = "auto_refund_15m"
+                                item["cancel_reason"] = "auto_refund_10m"
                                 item["assigned_at"] = 0
                                 d_st = get_daily_stats()
                                 d_st[country]["nocode"] = d_st[country].get("nocode", 0) + 1
                                 updated = True
-                                
-                                try:
-                                    await application.bot.send_message(
-                                        chat_id=int(user_id),
-                                        text=f"⏰ **Automatic Refund (15-Min Timeout)**\n\nNo OTP was received within 15 minutes for your {country} number. `${refund_amount:.3f} USD` has been refunded to your balance.",
-                                        parse_mode="Markdown"
-                                    )
-                                except Exception:
-                                    pass
+
+                                refund_text = (
+                                    f"⏰ **Automatic Refund (10-Min Timeout)**\n\n"
+                                    f"No OTP was received within 10 minutes for your {country} number. "
+                                    f"`${refund_amount:.3f} USD` has been refunded to your balance."
+                                )
+                                buy_again_markup = build_country_selection_markup()
+                                chat_id = item.get("chat_id") or int(user_id)
+                                message_id = item.get("message_id")
+
+                                edited = False
+                                if message_id:
+                                    try:
+                                        await application.bot.edit_message_text(
+                                            chat_id=int(chat_id),
+                                            message_id=int(message_id),
+                                            text=refund_text,
+                                            parse_mode="Markdown",
+                                            reply_markup=buy_again_markup
+                                        )
+                                        edited = True
+                                    except BadRequest as e:
+                                        if "message is not modified" in str(e).lower():
+                                            edited = True
+                                    except Exception:
+                                        pass
+
+                                if not edited:
+                                    try:
+                                        await application.bot.send_message(
+                                            chat_id=int(user_id),
+                                            text=refund_text,
+                                            parse_mode="Markdown",
+                                            reply_markup=buy_again_markup
+                                        )
+                                    except Exception:
+                                        pass
             if updated:
                 await save_db_async("config", config_db)
                 await save_db_async("users", users_db)
@@ -1371,7 +1399,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🌟 **Support & Refund Policy**\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🚨 • Fresh Link numbers have no auto refunds.\n"
-            "• Panel numbers can be canceled after 5 mins and auto-refund after **15 mins** if no OTP arrives.\n\n"
+            "• Panel numbers can be canceled after 5 mins and auto-refund after **10 mins** if no OTP arrives.\n\n"
             "For any issue, please message our Admin directly:"
         )
         markup = InlineKeyboardMarkup([
@@ -2825,7 +2853,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🌍 **Country :** {flag} **{country}**\n"
             f"📞 **Number :** `{item['number']}`\n"
             f"💵 **Price :** `${price:.3f} USD`\n\n"
-            f"⏳ *You have 15 minutes to receive the OTP.*\n\n"
+            f"⏳ *You have 10 minutes to receive the OTP.*\n\n"
             f"💡 *Request OTP in Telegram, then click* **Get Code**."
             f"{proxy_footer}"
         )
@@ -2836,9 +2864,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         
         if is_buy_another:
-            await context.bot.send_message(chat_id=user_id, text=num_msg, parse_mode="Markdown", reply_markup=markup)
+            sent_msg = await context.bot.send_message(chat_id=user_id, text=num_msg, parse_mode="Markdown", reply_markup=markup)
+            item["chat_id"] = sent_msg.chat_id
+            item["message_id"] = sent_msg.message_id
         else:
             await safe_edit_message_text(query, num_msg, parse_mode="Markdown", reply_markup=markup)
+            if query.message:
+                item["chat_id"] = query.message.chat_id
+                item["message_id"] = query.message.message_id
+        await save_db_async("data", data)
         await query.answer("✅ Number assigned!")
         return
 
