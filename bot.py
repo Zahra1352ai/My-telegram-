@@ -2295,9 +2295,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prices = config_db.get("prices", {"USA": 0.175, "China": 0.195, "Canada": 0.175, "MailTM": 0.01, "Proxy": 5.0})
         base_costs = config_db.get("base_costs", {"USA": 0.100, "China": 0.120, "Canada": 0.100})
         total_deposits = float(config_db.get("total_deposits", 0.0))
+        total_users = len(users_db)
+        total_bal = sum(float(u.get("balance", 0.0)) for u in users_db.values())
 
         lines_profit = [
             "📈 **COUNTRY & FINANCIAL PROFIT STATISTICS**",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"👥 **Total Users:** `{total_users}` | 💵 **Users Balance:** `${total_bal:.3f} USD`",
             "━━━━━━━━━━━━━━━━━━━━"
         ]
 
@@ -2392,34 +2396,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Statistics (Complete Country & Bot Number Breakdown in English)
     # ==========================================
     if text == "📊 Statistics":
-        total_users = len(users_db)
-        total_bal = sum(u.get("balance", 0.0) for u in users_db.values())
-        
-        inv_lines = []
-        for ck in get_all_country_keys():
-            c_all = data.get(ck, [])
-            c_free = len([n for n in c_all if n.get("status") == "free"])
-            c_otp = len([n for n in c_all if n.get("status") == "used" and n.get("has_code")])
-            cfg = get_country_config(ck)
-            inv_lines.append(f"{cfg.get('label', ck)} Inventory:\n   ├ 🆓 Free: `{c_free}`\n   └ ✅ OTP Received: `{c_otp}`")
-
-        today_num_cnt = get_total_today_usage_by_type("number")
-        today_email_cnt = get_total_today_usage_by_type("email")
-        today_proxy_cnt = get_total_today_usage_by_type("proxy")
-
-        stats_msg = (
-            f"📊 **BOT STATISTICS**\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"👥 **Total Users:** `{total_users}`\n"
-            f"💵 **Users Balance:** `${total_bal:.3f} USD`\n\n"
-            + "\n\n".join(inv_lines) +
-            f"\n\n📅 **Today's Activity (Iran Time):**\n"
-            f"   ├ 📱 Numbers Assigned: `{today_num_cnt}`\n"
-            f"   ├ 📧 Emails Purchased: `{today_email_cnt}`\n"
-            f"   └ 🌐 Proxies Purchased: `{today_proxy_cnt}`"
-        )
-        await send_long_markdown(update.message, stats_msg)
-
         country_summary_lines = ["🔢 **BOT NUMBER STATISTICS**", "━━━━━━━━━━━━━━━━━━"]
         grand_total_all = 0
         grand_received_all = 0
